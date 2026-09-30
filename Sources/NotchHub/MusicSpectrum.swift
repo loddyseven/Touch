@@ -26,6 +26,7 @@ final class SpectrumAnalyzer {
     private var previousBass = 0.0
     private var refractory = 0.0
     private var levels = [Double](repeating: 0, count: bandCount)
+    private var displayLevels = [Double](repeating: 0, count: bandCount)
     private var beatPresence = 0.0
     private let bandCenters: [Double] = [45, 65, 140, 700, 3200, 9000]
     private let bandWidths: [Double] = [32, 50, 90, 900, 2400, 7000]
@@ -71,6 +72,7 @@ final class SpectrumAnalyzer {
             rate = sampleRate; index = 0; filled = 0; hop = 0; bassFloor = 0; previousBass = 0
             refractory = 0; beatPresence = 0
             levels = Array(repeating: 0, count: Self.bandCount)
+            displayLevels = Array(repeating: 0, count: Self.bandCount)
             previousMagnitudes = Array(repeating: 0, count: fftSize / 2)
         }
         history[index] = value.isFinite ? min(4, max(-4, value)) : 0
@@ -173,8 +175,15 @@ final class SpectrumAnalyzer {
             if target >= levels[i] { levels[i] = target }
             else { levels[i] += (target - levels[i]) * (1 - exp(-dt / (release[i] * 0.48))) }
         }
-        for i in 0..<Self.bandCount { if levels[i] < 0.006 { levels[i] = 0 } }
-        return levels
+        for i in 0..<Self.bandCount {
+            if levels[i] < 0.006 { levels[i] = 0 }
+            // Round abrupt height changes without delaying beat detection or
+            // buffering frames. Rise quickly; let small downward steps settle.
+            let smoothing = levels[i] > displayLevels[i] ? 0.008 : 0.022
+            displayLevels[i] += (levels[i] - displayLevels[i]) * (1 - exp(-dt / smoothing))
+            if displayLevels[i] < 0.006, levels[i] == 0 { displayLevels[i] = 0 }
+        }
+        return displayLevels
     }
 }
 
