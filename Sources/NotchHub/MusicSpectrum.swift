@@ -51,6 +51,12 @@ final class SpectrumAnalyzer {
     private var lastAttempt = Date.distantPast
     private var generation = 0
     var isFixture = false
+    #if TOUCH_SCREENSHOT_FIXTURES
+    func previewLevels(_ values: [Double]) {
+        guard isFixture, values.count == 5 else { return }
+        levels = values.map { $0.isFinite ? min(1, max(0, $0)) : 0 }
+    }
+    #endif
     func start() {
         guard !isFixture, tap == nil, !needsPermission, Date().timeIntervalSince(lastAttempt) > 4 else { return }
         guard #available(macOS 14.2, *) else { return }
