@@ -194,7 +194,7 @@ enum Checks {
         for rate in [44100.0, 48000, 96000] {
             let result = analyze(rate: rate, signal: { kick($0) })
             check(result.hits.count == 6, "Six kick attacks produce six pulses at \(Int(rate)) Hz")
-            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.09 }, "Beat detection stays within 90ms at \(Int(rate)) Hz")
+            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.045 }, "Kick detection stays within 45ms at \(Int(rate)) Hz")
             check(result.last < 0.13, "Beat envelope settles between drum hits at \(Int(rate)) Hz")
         }
         let quiet = analyze(signal: { kick($0, amplitude: 0.06) })
@@ -212,6 +212,56 @@ enum Checks {
         check(analyze(signal: { 0.4 * sin(2 * .pi * 65 * $0) }).peak < 0.01, "Sustained bass does not create artificial beats")
         check(analyze(signal: { kick($0) + 0.18 * sin(2 * .pi * 175 * $0) + 0.14 * sin(2 * .pi * 350 * $0) }).hits.count == 6, "Kick attacks remain detectable under vocal-range harmonics")
         check(analyze(signal: { _ in 0 }).peak == 0, "Silence produces no artificial movement")
+        for rate in [44100.0, 48000, 96000] {
+            for kind in ["snare", "clap", "hat"] {
+                let analyzer = SpectrumAnalyzer()
+                var seed: UInt64 = 7
+                var low = 0.0, previous = 0.0, peak = 0.0
+                var events: [Double] = []
+                for sample in 0..<Int(rate * 3) {
+                    let time = Double(sample) / rate
+                    let phase = time.truncatingRemainder(dividingBy: 0.5)
+                    seed = seed &* 6364136223846793005 &+ 1
+                    let noise = Double(seed >> 32) / Double(UInt32.max) * 2 - 1
+                    low += (noise - low) * 0.4
+                    let envelope = kind == "clap"
+                        ? [0.0, 0.012, 0.026].reduce(0.0) { $0 + (phase >= $1 ? exp(-(phase - $1) / 0.009) : 0) }
+                        : exp(-phase / (kind == "hat" ? 0.016 : 0.045))
+                    let value = 0.22 * (kind == "hat" ? noise - low : noise) * envelope
+                    if let levels = analyzer.feed(Float(value), sampleRate: rate) {
+                        let pulse = levels[0]
+                        if pulse > previous + 0.12, time - (events.last ?? -1) > 0.1 { events.append(time) }
+                        previous = pulse; peak = max(peak, pulse)
+                    }
+                }
+                check(events.count == 6 && peak > 0.3, "Six \(kind) attacks remain visible at \(Int(rate)) Hz")
+                check(events.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.035 }, "\(kind) detection stays within 35ms at \(Int(rate)) Hz")
+            }
+            let sustain = analyze(rate: rate, signal: { $0 < 0.23 ? 0 : 0.4 * sin(2 * .pi * 45 * ($0 - 0.23)) })
+            check(sustain.peak < 0.01, "Starting a sustained low tone after silence does not become percussion at \(Int(rate)) Hz")
+        }
+        let syllables = analyze(signal: { time in
+            let phase = time.truncatingRemainder(dividingBy: 0.3)
+            let envelope = (1 - exp(-phase / 0.008)) * exp(-phase / 0.15)
+            var voice = 0.0
+            for harmonic in 1...18 { voice += sin(2 * .pi * 190 * Double(harmonic) * time) / Double(harmonic) }
+            return voice * envelope * 0.3
+        })
+        check(syllables.peak < 0.01, "Abrupt voiced syllables with upper harmonics do not trigger the percussion bands")
+        for mode in ["right only", "opposite phase", "mono"] {
+            let stereo = StereoSpectrumAnalyzer()
+            var previous = 0.0, hits = 0
+            for sample in 0..<144000 {
+                let value = Float(kick(Double(sample) / 48000))
+                let left: Float = mode == "right only" ? 0 : value
+                let right: Float? = mode == "mono" ? nil : (mode == "opposite phase" ? -value : value)
+                if let levels = stereo.feed(left: left, right: right, sampleRate: 48000) {
+                    if levels[0] > previous + 0.12 { hits += 1 }
+                    previous = levels[0]
+                }
+            }
+            check(hits == 6, "Stereo analysis retains six kicks with \(mode) audio")
+        }
         let invalid = SpectrumAnalyzer()
         check(invalid.feed(1, sampleRate: .nan) == nil && invalid.feed(1, sampleRate: 0) == nil, "Invalid sample rates never reach FFT bin conversion")
         var finite = true
@@ -233,7 +283,7 @@ enum Checks {
         }
         let lowBand = bandResponse(frequency: 45), upperBand = bandResponse(frequency: 85)
         check(lowBand.count == 6 && upperBand.count == 6, "Every analysis result supplies all six visible bars")
-        check(upperBand[4] / upperBand[1] > 4 * lowBand[4] / lowBand[1], "A change in bass frequency changes the bar pattern, not just overall height")
+        check(upperBand[2] / upperBand[1] > lowBand[2] / lowBand[1] + 0.1, "A change in bass frequency changes the bar pattern, not just overall height")
         let cadence = SpectrumAnalyzer()
         var updates = 0, settled = false
         for sample in 0..<48000 {
@@ -253,6 +303,12 @@ enum Checks {
         spectrum.isFixture = true
         spectrum.stop()
         check(spectrum.levels.count == 6 && spectrum.levels.allSatisfy { $0 == 0 }, "Stopping analysis leaves six resting bars")
+        let delivery = LatestSpectrumFrame()
+        check(delivery.offer([0.1]), "First audio update schedules UI delivery")
+        var singleDelivery = true
+        for frame in 1...200 { singleDelivery = !delivery.offer([Double(frame)]) && singleDelivery }
+        check(singleDelivery && delivery.take() == [200], "A busy UI receives the newest frame without queuing 200 old measurements")
+        check(delivery.take() == nil && delivery.offer([0.5]) && delivery.take() == [0.5], "Coalesced delivery resumes after the newest frame is consumed")
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 32, bitsPerPixel: 32)!
         for offset in stride(from: 0, to: 8 * 8 * 4, by: 4) {
             bitmap.bitmapData![offset] = 204

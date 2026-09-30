@@ -282,7 +282,7 @@ struct MusicWave: View {
                 Capsule().fill(color).frame(width: 2.5,
                     height: active && !reduced ? 3 + 20 * spectrum.levels[i] : 3)
             }
-        }.frame(height: 24).animation(reduced ? nil : .easeOut(duration: 0.035), value: spectrum.levels)
+        }.frame(height: 24).animation(nil, value: spectrum.levels)
             .animation(reduced ? nil : .easeOut(duration: 0.4), value: color).accessibilityHidden(true)
     }
 
