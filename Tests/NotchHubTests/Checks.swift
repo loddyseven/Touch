@@ -179,7 +179,7 @@ enum Checks {
                 if let values = analyzer.feed(Float(signal(time)), sampleRate: rate) {
                     let level = values.max() ?? 0
                     peak = max(peak, level)
-                    if level > last + 0.12 { hits.append(time) }
+                    if analyzer.beatStrength > 0, time - (hits.last ?? -1) > 0.075 { hits.append(time) }
                     last = level
                 }
             }
@@ -194,7 +194,7 @@ enum Checks {
         for rate in [44100.0, 48000, 96000] {
             let result = analyze(rate: rate, signal: { kick($0) })
             check(result.hits.count == 6, "Six kick attacks produce six pulses at \(Int(rate)) Hz")
-            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.045 }, "Kick detection stays within 45ms at \(Int(rate)) Hz")
+            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.025 }, "Kick attack detection stays within 25ms at \(Int(rate)) Hz")
             check(result.last < 0.13, "Beat envelope settles between drum hits at \(Int(rate)) Hz")
         }
         let quiet = analyze(signal: { kick($0, amplitude: 0.06) })
@@ -203,20 +203,21 @@ enum Checks {
             let amplitude = 0.45 + 0.25 * sin(2 * Double.pi * 4 * time)
             return amplitude * (0.5 * sin(2 * .pi * 175 * time) + 0.3 * sin(2 * .pi * 350 * time) + 0.2 * sin(2 * .pi * 700 * time))
         })
-        check(voice.peak < 0.01, "Modulated vocal-range harmonics do not drive the beat bars")
+        check(voice.hits.isEmpty && voice.peak > 0.05 && voice.peak < 0.5, "Vocal harmonics stay visible below drum intensity without false accents")
         let lowVoice = analyze(signal: { time in
             let amplitude = 0.45 + 0.25 * sin(2 * Double.pi * 4 * time)
             return amplitude * (0.35 * sin(2 * .pi * 90 * time) + 0.4 * sin(2 * .pi * 180 * time) + 0.25 * sin(2 * .pi * 360 * time))
         })
-        check(lowVoice.peak < 0.01, "A low vocal fundamental with speech harmonics is rejected")
-        check(analyze(signal: { 0.4 * sin(2 * .pi * 65 * $0) }).peak < 0.01, "Sustained bass does not create artificial beats")
+        check(lowVoice.hits.isEmpty && lowVoice.peak > 0.05 && lowVoice.peak < 0.6, "Low vocals move gently without full-strength beats")
+        let heldNote = analyze(signal: { 0.4 * sin(2 * .pi * 65 * $0) })
+        check(heldNote.hits.count <= 1 && heldNote.peak > 0.1, "Sustained bass remains visible without repeated artificial beat accents")
         check(analyze(signal: { kick($0) + 0.18 * sin(2 * .pi * 175 * $0) + 0.14 * sin(2 * .pi * 350 * $0) }).hits.count == 6, "Kick attacks remain detectable under vocal-range harmonics")
         check(analyze(signal: { _ in 0 }).peak == 0, "Silence produces no artificial movement")
         for rate in [44100.0, 48000, 96000] {
             for kind in ["snare", "clap", "hat"] {
                 let analyzer = SpectrumAnalyzer()
                 var seed: UInt64 = 7
-                var low = 0.0, previous = 0.0, peak = 0.0
+                var low = 0.0, peak = 0.0
                 var events: [Double] = []
                 for sample in 0..<Int(rate * 3) {
                     let time = Double(sample) / rate
@@ -229,16 +230,15 @@ enum Checks {
                         : exp(-phase / (kind == "hat" ? 0.016 : 0.045))
                     let value = 0.22 * (kind == "hat" ? noise - low : noise) * envelope
                     if let levels = analyzer.feed(Float(value), sampleRate: rate) {
-                        let pulse = levels[0]
-                        if pulse > previous + 0.12, time - (events.last ?? -1) > 0.1 { events.append(time) }
-                        previous = pulse; peak = max(peak, pulse)
+                        if analyzer.beatStrength > 0, time - (events.last ?? -1) > 0.1 { events.append(time) }
+                        peak = max(peak, levels[0])
                     }
                 }
                 check(events.count == 6 && peak > 0.3, "Six \(kind) attacks remain visible at \(Int(rate)) Hz")
                 check(events.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.035 }, "\(kind) detection stays within 35ms at \(Int(rate)) Hz")
             }
             let sustain = analyze(rate: rate, signal: { $0 < 0.23 ? 0 : 0.4 * sin(2 * .pi * 45 * ($0 - 0.23)) })
-            check(sustain.peak < 0.01, "Starting a sustained low tone after silence does not become percussion at \(Int(rate)) Hz")
+            check(sustain.hits.count <= 1 && sustain.peak > 0.1, "A sustained low tone stays visible without repeated drum accents at \(Int(rate)) Hz")
         }
         let syllables = analyze(signal: { time in
             let phase = time.truncatingRemainder(dividingBy: 0.3)
@@ -247,20 +247,26 @@ enum Checks {
             for harmonic in 1...18 { voice += sin(2 * .pi * 190 * Double(harmonic) * time) / Double(harmonic) }
             return voice * envelope * 0.3
         })
-        check(syllables.peak < 0.01, "Abrupt voiced syllables with upper harmonics do not trigger the percussion bands")
+        check(syllables.hits.isEmpty && syllables.peak > 0.05 && syllables.peak < 0.5, "Voiced syllables remain visible without overpowering drum accents")
+        let melody = analyze(signal: { time in
+            let phase = time.truncatingRemainder(dividingBy: 0.4)
+            let frequency = [440.0, 1200, 660, 2400][Int(time / 0.4) % 4]
+            return 0.24 * sin(2 * .pi * frequency * phase) * (1 - exp(-phase / 0.01)) * exp(-phase / 0.25)
+        })
+        check(melody.hits.isEmpty && melody.peak > 0.18, "A melody without drums remains visibly animated")
         for mode in ["right only", "opposite phase", "mono"] {
             let stereo = StereoSpectrumAnalyzer()
-            var previous = 0.0, hits = 0
+            var hits: [Double] = []
             for sample in 0..<144000 {
                 let value = Float(kick(Double(sample) / 48000))
                 let left: Float = mode == "right only" ? 0 : value
                 let right: Float? = mode == "mono" ? nil : (mode == "opposite phase" ? -value : value)
-                if let levels = stereo.feed(left: left, right: right, sampleRate: 48000) {
-                    if levels[0] > previous + 0.12 { hits += 1 }
-                    previous = levels[0]
+                if stereo.feed(left: left, right: right, sampleRate: 48000) != nil {
+                    let time = Double(sample) / 48000
+                    if stereo.beatStrength > 0, time - (hits.last ?? -1) > 0.075 { hits.append(time) }
                 }
             }
-            check(hits == 6, "Stereo analysis retains six kicks with \(mode) audio")
+            check(hits.count == 6, "Stereo analysis retains six kicks with \(mode) audio")
         }
         let invalid = SpectrumAnalyzer()
         check(invalid.feed(1, sampleRate: .nan) == nil && invalid.feed(1, sampleRate: 0) == nil, "Invalid sample rates never reach FFT bin conversion")

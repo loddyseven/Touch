@@ -283,6 +283,7 @@ struct MusicWave: View {
                     height: active && !reduced ? 3 + 20 * spectrum.levels[i] : 3)
             }
         }.frame(height: 24).animation(nil, value: spectrum.levels)
+            .onChange(of: spectrum.levels) { _, _ in SpectrumTiming.shared.viewUpdated() }
             .animation(reduced ? nil : .easeOut(duration: 0.4), value: color).accessibilityHidden(true)
     }
 

@@ -3,8 +3,8 @@ import Accelerate
 import CoreAudio
 import Combine
 
-/// Short overlapping windows detect bass attacks and broadband percussion.
-/// Harmonic vocals do not open the envelopes; no synthetic idle motion is used.
+/// A continuous spectrum preserves melody and quiet details. Percussion adds
+/// accents while the vocal midrange is weighted more gently.
 final class SpectrumAnalyzer {
     static let size = 1024
     static let bandCount = 6
@@ -24,8 +24,6 @@ final class SpectrumAnalyzer {
     private var rate: Double = 0
     private var bassFloor = 0.0
     private var previousBass = 0.0
-    private var pendingPeak: Double?
-    private var pendingAge = 0.0
     private var refractory = 0.0
     private var levels = [Double](repeating: 0, count: bandCount)
     private var beatPresence = 0.0
@@ -35,7 +33,10 @@ final class SpectrumAnalyzer {
     private var previousPercussion = [Double](repeating: 0, count: 2)
     private var percussionCooldown = [Double](repeating: 0, count: 2)
     private var percussionAttack = [Double](repeating: 0, count: 2)
-    private let release: [Double] = [0.105, 0.125, 0.155, 0.18, 0.15, 0.115]
+    private var previousBands = [Double](repeating: 0, count: bandCount)
+    private let musicWeight: [Double] = [0.40, 0.55, 0.32, 0.30, 0.40, 0.55]
+    private(set) var beatStrength = 0.0
+    private let release: [Double] = [0.06, 0.055, 0.075, 0.08, 0.07, 0.045]
 
     init() {
         setup = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(Self.size), .FORWARD)
@@ -65,8 +66,10 @@ final class SpectrumAnalyzer {
             previousPercussion = Array(repeating: 0, count: 2)
             percussionCooldown = Array(repeating: 0, count: 2)
             percussionAttack = Array(repeating: 0, count: 2)
+            previousBands = Array(repeating: 0, count: Self.bandCount)
+            beatStrength = 0
             rate = sampleRate; index = 0; filled = 0; hop = 0; bassFloor = 0; previousBass = 0
-            pendingPeak = nil; pendingAge = 0; refractory = 0; beatPresence = 0
+            refractory = 0; beatPresence = 0
             levels = Array(repeating: 0, count: Self.bandCount)
             previousMagnitudes = Array(repeating: 0, count: fftSize / 2)
         }
@@ -117,22 +120,13 @@ final class SpectrumAnalyzer {
         let bassShare = bassEnergy / max(0.000001, bassEnergy + vocalEnergy)
         var hit = 0.0
         refractory = max(0, refractory - dt)
-        if let peak = pendingPeak {
-            pendingAge += dt
-            pendingPeak = max(peak, bass)
-            // Confirm a small fall in a short window; waiting for the full
-            // decay makes the visual beat visibly late.
-            if bass < peak * 0.92, pendingAge <= 0.15 {
-                hit = min(1, max(0, (20 * log10(max(peak, 0.000001)) + 48) / 38))
-                pendingPeak = nil; refractory = 0.12
-            } else if pendingAge > 0.15 {
-                pendingPeak = nil
-            }
-        }
-        if pendingPeak == nil, hit == 0, refractory == 0,
+        // React to the rising edge. Waiting for a fall moves the visible
+        // accent behind the sound, especially on long bass notes.
+        if refractory == 0,
            bass > max(0.008, bassFloor * 1.45), bass > previousBass * 1.18,
            fluxAmplitude > bass * 0.22, bassShare > 0.45 {
-            pendingPeak = bass; pendingAge = 0
+            hit = min(1, max(0, (20 * log10(max(bass, 0.000001)) + 48) / 38))
+            refractory = 0.12
         }
         for zone in 0..<2 {
             percussionCooldown[zone] = max(0, percussionCooldown[zone] - dt)
@@ -160,14 +154,21 @@ final class SpectrumAnalyzer {
         let floorBlend = 1 - exp(-dt / 0.8)
         bassFloor += (bass - bassFloor) * floorBlend
         previousBass = bass
-        beatPresence = max(hit, beatPresence * exp(-dt / 0.18))
+        beatStrength = hit
+        beatPresence = max(hit, beatPresence * exp(-dt / 0.10))
         if beatPresence < 0.006 { beatPresence = 0 }
-        levels[0] = max(hit, levels[0] * exp(-dt / release[0]))
+        let bassBody = bass / (bass + 0.08)
+        levels[0] = max(hit, bassBody * musicWeight[0], levels[0] * exp(-dt / release[0]))
         for i in 1..<Self.bandCount {
-            // A confirmed drum attack opens the measured frequency bands.
             let amplitude = sqrt(bands[i]) * 4 / Double(fftSize)
             let body = min(1, max(0, (20 * log10(max(0.000001, amplitude)) + 58) / 43))
-            let target = beatPresence * body * 0.83
+            // Melody is never gated by the drum detector. Use a soft amplitude
+            // curve so normal music does not pin all bars at the same height.
+            let musicalBody = amplitude / (amplitude + 0.08)
+            let rise = max(0, amplitude - previousBands[i]) / max(0.008, amplitude)
+            let noteAccent = min(i == 2 || i == 3 ? 0.08 : 0.16, rise * musicalBody * 0.22)
+            let target = max(beatPresence * body * 0.83, musicalBody * musicWeight[i] + noteAccent)
+            previousBands[i] = amplitude
             // Attack immediately. Only the falling edge needs smoothing.
             if target >= levels[i] { levels[i] = target }
             else { levels[i] += (target - levels[i]) * (1 - exp(-dt / (release[i] * 0.48))) }
@@ -183,10 +184,12 @@ final class LatestSpectrumFrame: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: [Double]?
     private var scheduled = false
+    private var offeredAt = 0.0
 
     func offer(_ values: [Double]) -> Bool {
         lock.lock(); defer { lock.unlock() }
         pending = values
+        if SpectrumTiming.shared.enabled { offeredAt = ProcessInfo.processInfo.systemUptime }
         guard !scheduled else { return false }
         scheduled = true
         return true
@@ -195,6 +198,9 @@ final class LatestSpectrumFrame: @unchecked Sendable {
     func take() -> [Double]? {
         lock.lock(); defer { lock.unlock() }
         let values = pending
+        if values != nil, SpectrumTiming.shared.enabled {
+            SpectrumTiming.shared.add("main_handoff_ms", (ProcessInfo.processInfo.systemUptime - offeredAt) * 1000)
+        }
         pending = nil; scheduled = false
         return values
     }
@@ -205,11 +211,13 @@ final class LatestSpectrumFrame: @unchecked Sendable {
 final class StereoSpectrumAnalyzer {
     private let left = SpectrumAnalyzer()
     private let right = SpectrumAnalyzer()
+    private(set) var beatStrength = 0.0
 
     func feed(left leftSample: Float, right rightSample: Float?, sampleRate: Double) -> [Double]? {
         let leftLevels = left.feed(leftSample, sampleRate: sampleRate)
         let rightLevels = right.feed(rightSample ?? 0, sampleRate: sampleRate)
         guard let leftLevels, let rightLevels else { return nil }
+        beatStrength = max(left.beatStrength, right.beatStrength)
         return zip(leftLevels, rightLevels).map { max($0, $1) }
     }
 }
@@ -239,6 +247,7 @@ final class StereoSpectrumAnalyzer {
                 guard latest.offer(values) else { return }
                 Task { @MainActor in
                     guard let values = latest.take(), let self, self.generation == current else { return }
+                    SpectrumTiming.shared.published()
                     self.levels = values
                 }
             }
@@ -309,7 +318,9 @@ private final class YandexAudioTap {
             configureBuffer()
             let sampleRate = format.mSampleRate
             let analyzer = self.analyzer
-            result = AudioDeviceCreateIOProcIDWithBlock(&ioProc, deviceID, queue) { _, input, _, _, _ in
+            let timing = SpectrumTiming.shared
+            result = AudioDeviceCreateIOProcIDWithBlock(&ioProc, deviceID, queue) { _, input, inputTime, _, _ in
+                let began = timing.enabled ? ProcessInfo.processInfo.systemUptime : 0
                 let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
                 guard let buffer = buffers.first, let bytes = buffer.mData else { return }
                 let channels = max(1, Int(buffer.mNumberChannels))
@@ -328,6 +339,17 @@ private final class YandexAudioTap {
                     if let values = analyzer.feed(left: samples[frame * channels],
                                                   right: rightSamples?[frame * rightStride],
                                                   sampleRate: sampleRate) { newest = values }
+                }
+                if timing.enabled {
+                    if inputTime.pointee.mFlags.contains(.sampleTimeValid) {
+                        timing.input(sampleTime: inputTime.pointee.mSampleTime, frames: frames)
+                    }
+                    timing.add("buffer_ms", Double(frames) / sampleRate * 1000)
+                    timing.add("dsp_ms", (ProcessInfo.processInfo.systemUptime - began) * 1000)
+                    if inputTime.pointee.mFlags.contains(.hostTimeValid) {
+                        let source = Double(AudioConvertHostTimeToNanos(inputTime.pointee.mHostTime)) / 1e9
+                        timing.add("audio_age_ms", (began - source - Double(frames) / sampleRate) * 1000)
+                    }
                 }
                 if let newest { received(newest) }
             }
@@ -349,7 +371,7 @@ private final class YandexAudioTap {
               range.mMinimum.isFinite, range.mMaximum.isFinite,
               range.mMinimum >= 1, range.mMaximum >= range.mMinimum,
               range.mMaximum <= Double(UInt32.max) else { return }
-        var frames = UInt32(min(range.mMaximum, max(range.mMinimum, 256)))
+        var frames = UInt32(min(range.mMaximum, max(range.mMinimum, 128)))
         _ = AudioObjectSetPropertyData(deviceID, &key, 0, nil, UInt32(MemoryLayout<UInt32>.size), &frames)
     }
 
