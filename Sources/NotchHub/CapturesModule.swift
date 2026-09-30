@@ -165,7 +165,12 @@ struct CapturesModule: View {
     private var status: some View {
         HStack(spacing: 8) {
             if let message = recorder.message ?? store.message {
-                Text(message).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Text(message).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).help(message)
+            }
+            if !recorder.phase.isBusy, recorder.recoveryURL != nil || recorder.failureDetailsURL != nil {
+                Button(model.tr("Файл и подробности", "File and details")) { recorder.revealRecovery() }
+                    .font(.system(size: 11))
+                    .help(model.tr("Показать незавершённую запись и причину ошибки в Finder", "Show the unfinished recording and error details in Finder"))
             }
             if recorder.needsPermission || store.needsPermissionHelp {
                 Button(model.tr("Разрешить запись экрана", "Screen recording access")) { store.openPermissions() }

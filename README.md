@@ -12,7 +12,7 @@
 
 Нативное приложение на SwiftUI и AppKit. Открывается по наведению, сворачивается обратно в чёлку и оставляет нужное под рукой.
 
-[Видео: Touch за 30 секунд](https://github.com/loddyseven/Touch/releases/download/v2.4.10/Touch-30s-Vertical.mp4) · [Скачать Touch для Apple Silicon](https://github.com/loddyseven/Touch/releases/latest)
+[Видео: Touch за 30 секунд](https://github.com/loddyseven/Touch/releases/download/v2.4.11/Touch-30s-Vertical.mp4) · [Скачать Touch для Apple Silicon](https://github.com/loddyseven/Touch/releases/latest)
 
 ## Интерфейс
 
@@ -84,6 +84,8 @@ bash scripts/test.sh
 Touch сохраняет свои снимки и записи в `~/Pictures/NotchHub`. Очистка списка в приложении не удаляет оригиналы. История буфера и недавно прослушанных треков хранится в памяти до выхода.
 
 Для захвата экрана и звука macOS запрашивает соответствующие разрешения. Подключение Яндекс Музыки настраивается в Touch. При установке на другой Mac разрешения выдаются заново.
+
+Если запись не удалось завершить, Touch оставляет исходный файл и сохраняет локальный отчёт с версией macOS, режимом записи и кодом ошибки. Кнопка «Файл и подробности» показывает их в Finder; незавершённые записи доступны и после перезапуска.
 
 ## Лицензия
 

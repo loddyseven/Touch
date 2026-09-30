@@ -34,6 +34,7 @@ struct RecordingTarget: Equatable {
 
 @MainActor protocol RecordingSessionProtocol: AnyObject {
     var started: (() -> Void)? { get set }
+    var interrupted: ((Error) -> Void)? { get set }
     var finished: ((Error?) -> Void)? { get set }
     func start(target: RecordingTarget, audio: Bool, output: URL) async throws
     func stop() async throws
@@ -49,6 +50,8 @@ final class ScreenRecorder: ObservableObject {
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var message: String?
     @Published private(set) var needsPermission = false
+    @Published private(set) var recoveryURL: URL?
+    @Published private(set) var failureDetailsURL: URL?
     var beforeSelection: (() -> Void)?
     var afterSelection: ((Bool) -> Void)?
     var countdownBegan: (() -> Void)?
@@ -69,6 +72,8 @@ final class ScreenRecorder: ObservableObject {
     private var selector: RecordingRegionSelector?
     private var startedAt: TimeInterval = 0
     private var stopWhenStarted = false
+    private var captureError: Error?
+    private var validatingAsset: AVURLAsset?
 
     init(folder: URL, countdownInterval: Duration = .seconds(1), completionTimeout: Duration = .seconds(20),
          makeSession: @escaping @MainActor () throws -> any RecordingSessionProtocol = {
@@ -76,6 +81,15 @@ final class ScreenRecorder: ObservableObject {
              return ScreenCaptureSession()
          }) {
         self.folder = folder; self.makeSession = makeSession; self.countdownInterval = countdownInterval; self.completionTimeout = completionTimeout
+        // Failed captures from earlier runs remain recoverable, including old builds.
+        recoveryURL = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]))?
+            .filter { $0.lastPathComponent.hasPrefix(".Recording-") && $0.pathExtension == "mp4" && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 }
+            .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) > ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }.first
+    }
+
+    func revealRecovery() {
+        let files = [recoveryURL, failureDetailsURL].compactMap { $0 }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if !files.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(files) }
     }
 
     var clock: String {
@@ -109,7 +123,7 @@ final class ScreenRecorder: ObservableObject {
     func begin(target: RecordingTarget) {
         guard !phase.isBusy else { return }
         let id = UUID(); operationID = id
-        elapsed = 0; message = nil
+        elapsed = 0; message = nil; captureError = nil; failureDetailsURL = nil
         let audio = capturesAudio
         phase = .countdown(3); countdownBegan?()
         task = Task { [weak self] in
@@ -147,9 +161,13 @@ final class ScreenRecorder: ObservableObject {
                     guard let self, self.operationID == id else { return }
                     Task { @MainActor in await self.finish(error: error, id: id) }
                 }
+                session.interrupted = { [weak self] error in self?.awaitOutput(after: error, id: id) }
                 try await session.start(target: target, audio: audio, output: temporary)
             } catch is CancellationError { }
-            catch { await self.fail(error, id: id) }
+            catch {
+                if self.phase == .recording || self.phase == .finishing { self.awaitOutput(after: error, id: id) }
+                else { await self.fail(error, id: id) }
+            }
         }
     }
 
@@ -165,44 +183,87 @@ final class ScreenRecorder: ObservableObject {
             armWatchdog(id: id)
             task = Task { [weak self] in
                 do { try await session.stop() }
-                catch { await self?.finish(error: error, id: id) }
+                catch { self?.awaitOutput(after: error, id: id) }
             }
         case .preparing: stopWhenStarted = true
         default: break
         }
     }
 
+    private func awaitOutput(after error: Error, id: UUID) {
+        guard operationID == id else { return }
+        captureError = captureError ?? error
+        // Stream shutdown is not the recording writer's completion. Retain the
+        // session until its output delegate closes the MP4 (or the watchdog fires).
+        if phase != .finishing {
+            phase = .finishing; timer?.invalidate(); timer = nil
+            armWatchdog(id: id)
+        }
+    }
+
     private func finish(error: Error?, id: UUID) async {
         guard operationID == id, !isFinalizing, let temporaryURL, let outputURL else { return }
         isFinalizing = true
-        watchdog?.cancel(); watchdog = nil
+        armWatchdog(id: id)
         phase = .finishing; timer?.invalidate(); timer = nil
+        let recordingError = error ?? captureError
         do {
-            let asset = AVURLAsset(url: temporaryURL)
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            let duration = try await asset.load(.duration).seconds
-            guard !tracks.isEmpty, duration.isFinite, duration > 0 else { throw RecordingError.empty }
+            // A fresh asset avoids caching an early "Cannot Open" while the
+            // framework publishes the MP4 footer. The watchdog also bounds loads.
+            for attempt in 0..<12 {
+                guard operationID == id else { return }
+                let asset = AVURLAsset(url: temporaryURL); validatingAsset = asset
+                do {
+                    let tracks = try await asset.loadTracks(withMediaType: .video)
+                    let duration = try await asset.load(.duration).seconds
+                    guard !tracks.isEmpty, duration.isFinite, duration > 0 else { throw RecordingError.empty }
+                    break
+                } catch {
+                    asset.cancelLoading()
+                    guard operationID == id else { return }
+                    if attempt == 11 { throw error }
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+            }
             guard operationID == id else { return }
             try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
             reset(); showsSetup = false
-            message = error == nil ? nil : "Запись прервана. Доступная часть видео сохранена."
+            message = recordingError == nil ? nil : "Запись прервана. Доступная часть видео сохранена."
             saved?(outputURL); becameIdle?()
-        } catch { await fail(error, id: id) }
+        } catch { await fail(recordingError ?? error, id: id, validationError: error) }
     }
 
-    private func fail(_ error: Error, id: UUID) async {
+    private func fail(_ error: Error, id: UUID, validationError: Error? = nil) async {
         guard operationID == id else { return }
         let current = session, unfinished = temporaryURL
+        writeFailureDetails(error, validationError: validationError, id: id)
         reset()
-        current?.started = nil; current?.finished = nil
+        current?.started = nil; current?.interrupted = nil; current?.finished = nil
         // Do not block exit if the framework stops responding. Preserve nonempty
         // unfinished output so an interrupted capture is never silently deleted.
         Task { try? await current?.stop() }
-        if let unfinished, (try? unfinished.resourceValues(forKeys: [.fileSizeKey]).fileSize) == 0 {
-            try? FileManager.default.removeItem(at: unfinished)
-        }
-        message = "Не удалось сохранить запись. \(error.localizedDescription)"
+        // Even a zero-byte file can still belong to a delayed writer. Never
+        // unlink its destination while asynchronous stop/finalization is running.
+        if let unfinished, FileManager.default.fileExists(atPath: unfinished.path) { recoveryURL = unfinished }
+        message = "Не удалось завершить запись. \(error.localizedDescription)"
         becameIdle?()
+    }
+
+    private func writeFailureDetails(_ error: Error, validationError: Error?, id: UUID) {
+        var lines = ["Touch \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "test")", ProcessInfo.processInfo.operatingSystemVersionString,
+                     "Date: \(Date())", "Phase: \(phase)", "Elapsed: \(elapsed)", "System audio: \(capturesAudio)",
+                     "File: \(temporaryURL?.lastPathComponent ?? "none")",
+                     "Bytes: \(temporaryURL.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0)"]
+        for (name, error) in [("Capture", Optional(error)), ("Validation", validationError)] {
+            var current = error as NSError?
+            for _ in 0..<5 {
+                guard let value = current else { break }
+                lines.append("\(name): \(value.domain) (\(value.code)): \(value.localizedDescription)")
+                current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+            }
+        }
+        let destination = folder.appendingPathComponent("Recording-error-\(id).txt")
+        if (try? lines.joined(separator: "\n").write(to: destination, atomically: true, encoding: .utf8)) != nil { failureDetailsURL = destination }
     }
 
     private func armWatchdog(id: UUID) {
@@ -212,17 +273,18 @@ final class ScreenRecorder: ObservableObject {
             do { try await Task.sleep(for: self.completionTimeout) } catch { return }
             guard self.operationID == id else { return }
             self.task?.cancel()
-            await self.fail(RecordingError.timeout, id: id)
+            await self.fail(self.captureError ?? RecordingError.timeout, id: id, validationError: RecordingError.timeout)
         }
     }
 
     private func reset() {
         watchdog?.cancel(); watchdog = nil; isFinalizing = false
+        validatingAsset?.cancelLoading(); validatingAsset = nil
         timer?.invalidate(); timer = nil
-        session?.started = nil; session?.finished = nil
+        session?.started = nil; session?.interrupted = nil; session?.finished = nil
         session = nil; task = nil; operationID = nil; temporaryURL = nil; outputURL = nil
         phase = .idle
-        stopWhenStarted = false
+        stopWhenStarted = false; captureError = nil
     }
 
     enum RecordingError: LocalizedError {
@@ -241,10 +303,13 @@ final class ScreenRecorder: ObservableObject {
 @available(macOS 15, *)
 @MainActor private final class ScreenCaptureSession: NSObject, RecordingSessionProtocol, SCStreamDelegate, SCRecordingOutputDelegate {
     var started: (() -> Void)?
+    var interrupted: ((Error) -> Void)?
     var finished: ((Error?) -> Void)?
     private var stream: SCStream?
     private var recording: SCRecordingOutput?
     private var didFinish = false
+    private var stopRequested = false
+    private var streamError: Error?
 
     func start(target: RecordingTarget, audio: Bool, output: URL) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -271,7 +336,18 @@ final class ScreenRecorder: ObservableObject {
         try await stream.startCapture()
     }
 
-    func stop() async throws { if let stream { try await stream.stopCapture() } }
+    func stop() async throws {
+        guard !stopRequested, let stream else { return }
+        stopRequested = true
+        do { try await stream.stopCapture() }
+        catch {
+            streamError = streamError ?? error
+            // Explicit removal asks the file writer to finish even if capture
+            // has already stopped (for example from the macOS recording menu).
+            if let recording { try? stream.removeRecordingOutput(recording) }
+            throw error
+        }
+    }
 
     nonisolated func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
         Task { @MainActor [weak self] in self?.started?() }
@@ -283,10 +359,17 @@ final class ScreenRecorder: ObservableObject {
         Task { @MainActor [weak self] in self?.complete(error) }
     }
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
-        Task { @MainActor [weak self] in self?.complete(error) }
+        Task { @MainActor [weak self] in
+            guard let self, !self.didFinish else { return }
+            self.streamError = self.streamError ?? error
+            self.interrupted?(error)
+        }
     }
     private func complete(_ error: Error?) {
         guard !didFinish else { return }; didFinish = true
-        finished?(error)
+        // An output failure can leave the capture stream alive. Keep ownership
+        // through cleanup even if the recorder releases this completed session.
+        if !stopRequested { Task { try? await self.stop() } }
+        finished?(error ?? streamError)
     }
 }

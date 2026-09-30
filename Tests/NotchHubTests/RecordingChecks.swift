@@ -3,6 +3,7 @@ import AVFoundation
 
 @MainActor final class FakeRecordingSession: RecordingSessionProtocol {
     var started: (() -> Void)?
+    var interrupted: ((Error) -> Void)?
     var finished: ((Error?) -> Void)?
     var output: URL?
     var starts = 0
@@ -13,15 +14,34 @@ import AVFoundation
     var movie: URL?
     var signalsStart = true
     var finishError: Error?
+    var stopError: Error?
+    var finishDelay: Duration = .zero
+    var delayFileUntilFinish = false
+    var signalsFinish = true
+    var signalsFinishBeforeFile = false
     func start(target: RecordingTarget, audio: Bool, output: URL) async throws {
         starts += 1; self.audio = audio; self.output = output
         if let startError { throw startError }
         if delay > .zero { try await Task.sleep(for: delay) }
-        if let movie { try FileManager.default.copyItem(at: movie, to: output) }
+        if let movie, !delayFileUntilFinish { try FileManager.default.copyItem(at: movie, to: output) }
         else { try Data().write(to: output) }
         if signalsStart { started?() }
     }
-    func stop() async throws { stops += 1; finished?(finishError) }
+    func stop() async throws {
+        stops += 1
+        guard stops == 1 else { return }
+        if let stopError { interrupted?(stopError) }
+        if finishDelay == .zero, signalsFinish { finished?(finishError) }
+        else if signalsFinish {
+            if signalsFinishBeforeFile { finished?(finishError) }
+            Task { @MainActor in
+                try? await Task.sleep(for: finishDelay)
+                if delayFileUntilFinish, let movie, let output { try? Data(contentsOf: movie).write(to: output) }
+                if !signalsFinishBeforeFile { finished?(finishError) }
+            }
+        }
+        if let stopError { throw stopError }
+    }
 }
 
 @MainActor func recordingChecks(check: (Bool, String) -> Void) throws {
@@ -55,10 +75,15 @@ import AVFoundation
         CVPixelBufferLockBaseAddress(buffer, [])
         memset(CVPixelBufferGetBaseAddress(buffer), Int32(90 + index * 5), CVPixelBufferGetBytesPerRow(buffer) * 96)
         CVPixelBufferUnlockBaseAddress(buffer, [])
-        guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index), timescale: 30)) else { throw writer.error! }
+        // A silent 36-second movie reproduces the reported duration without
+        // requiring a live capture or waiting 36 seconds in every test run.
+        guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index * 2), timescale: 1)) else { throw writer.error! }
     }
-    input.markAsFinished(); writer.finishWriting { }
+    input.markAsFinished(); writer.endSession(atSourceTime: CMTime(value: 36, timescale: 1)); writer.finishWriting { }
     guard wait({ writer.status == .completed || writer.status == .failed }), writer.status == .completed else { throw writer.error ?? ScreenRecorder.RecordingError.empty }
+    var fixtureDuration = 0.0
+    Task { @MainActor in fixtureDuration = (try? await AVURLAsset(url: fixture).load(.duration).seconds) ?? 0 }
+    check(wait { fixtureDuration > 0 } && abs(fixtureDuration - 36) < 0.1, "The recording regression fixture contains 36 seconds of video without audio")
 
     let target = RecordingTarget(displayID: 1, sourceRect: nil)
     let cancelledBackend = FakeRecordingSession()
@@ -84,11 +109,37 @@ import AVFoundation
     check(wait { store.items.first?.thumbnail != nil }, "Video preview is generated asynchronously")
     check(!FileManager.default.fileExists(atPath: backend.output!.path), "Finalizing moves the hidden temporary movie to its visible filename")
 
+    let lateBackend = FakeRecordingSession(); lateBackend.movie = fixture
+    lateBackend.delayFileUntilFinish = true; lateBackend.finishDelay = .milliseconds(400)
+    lateBackend.stopError = NSError(domain: "SCStreamErrorDomain", code: -3817)
+    let late = ScreenRecorder(folder: root.appendingPathComponent("Delayed writer"), countdownInterval: .milliseconds(1), makeSession: { lateBackend })
+    var lateSaved: [URL] = []; late.saved = { lateSaved.append($0) }
+    late.begin(target: target); _ = wait { late.phase == .recording }; late.stop()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+    check(late.phase == .finishing && lateSaved.isEmpty && late.message == nil, "Stream-stop errors cannot validate or discard an MP4 before the writer finishes")
+    check(wait { late.phase == .idle && lateSaved.count == 1 } && !lateBackend.audio, "A delayed silent 36-second recording is saved after its output callback")
+
+    let flushBackend = FakeRecordingSession(); flushBackend.movie = fixture
+    flushBackend.delayFileUntilFinish = true; flushBackend.finishDelay = .milliseconds(400); flushBackend.signalsFinishBeforeFile = true
+    let flushed = ScreenRecorder(folder: root.appendingPathComponent("Delayed footer"), countdownInterval: .milliseconds(1), makeSession: { flushBackend })
+    var flushSaved = false; flushed.saved = { _ in flushSaved = true }
+    flushed.begin(target: target); _ = wait { flushed.phase == .recording }; flushed.stop()
+    check(wait { flushed.phase == .idle && flushSaved }, "Transient Cannot Open during footer publication retries with a fresh asset")
+
+    let interruptedWriter = FakeRecordingSession(); interruptedWriter.movie = fixture
+    let streamFailure = ScreenRecorder(folder: folder, countdownInterval: .milliseconds(1), makeSession: { interruptedWriter })
+    var streamSaved = 0; streamFailure.saved = { _ in streamSaved += 1 }
+    streamFailure.begin(target: target); _ = wait { streamFailure.phase == .recording }
+    interruptedWriter.interrupted?(ScreenRecorder.RecordingError.displayMissing)
+    check(streamFailure.phase == .finishing && streamSaved == 0, "An external stream interruption waits for the recording-output delegate")
+    interruptedWriter.finished?(nil); interruptedWriter.finished?(nil)
+    check(wait { streamFailure.phase == .idle && streamSaved == 1 }, "Duplicate output callbacks save an interrupted movie exactly once")
+
     let failedBackend = FakeRecordingSession(); failedBackend.startError = ScreenRecorder.RecordingError.displayMissing
     let failed = ScreenRecorder(folder: folder, countdownInterval: .milliseconds(1), makeSession: { failedBackend })
     failed.begin(target: target)
     check(wait { failed.phase == .idle && failed.message != nil }, "Capture-start errors return controls to an actionable state")
-    check(CaptureStore(folder: folder).items.count == 1, "A failed recording does not remove previously saved videos")
+    check(CaptureStore(folder: folder).items.count == 2, "A failed recording does not remove previously saved videos")
 
     let delayedBackend = FakeRecordingSession(); delayedBackend.movie = fixture; delayedBackend.delay = .milliseconds(150)
     let delayed = ScreenRecorder(folder: folder, countdownInterval: .milliseconds(1), makeSession: { delayedBackend })
@@ -116,5 +167,14 @@ import AVFoundation
     timedOut.begin(target: target)
     check(wait { timedOut.phase == .idle && timeoutReported } && timedOut.message != nil, "A missing system callback cannot leave recording or app exit stuck forever")
     check(silentBackend.output.map { FileManager.default.fileExists(atPath: $0.path) } == true, "Timeout preserves a nonempty unfinished recording for recovery")
+
+    let strandedBackend = FakeRecordingSession(); strandedBackend.movie = fixture; strandedBackend.signalsFinish = false
+    let stranded = ScreenRecorder(folder: folder, countdownInterval: .milliseconds(1), completionTimeout: .milliseconds(100), makeSession: { strandedBackend })
+    stranded.begin(target: target); _ = wait { stranded.phase == .recording }; stranded.stop()
+    check(wait { stranded.phase == .idle && stranded.message != nil } && stranded.recoveryURL == strandedBackend.output, "A missing output callback leaves an accessible recovery file")
+    let details = stranded.failureDetailsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    check(details?.contains("System audio: false") == true && details?.contains("Capture:") == true, "Recording failures retain local OS, audio mode, and error-code diagnostics")
+    let relaunched = ScreenRecorder(folder: folder, makeSession: { FakeRecordingSession() })
+    check(relaunched.recoveryURL != nil, "Unfinished recordings remain discoverable after relaunch")
 
 }
