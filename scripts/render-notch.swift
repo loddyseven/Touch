@@ -29,17 +29,26 @@ import UniformTypeIdentifiers
         host.layoutSubtreeIfNeeded()
 
         let gif = output.appendingPathComponent("music-notch.gif")
-        let frames = 48
+        let frames = 80
+        let analyzer = SpectrumAnalyzer()
+        var sampledLevels = [[Double]]()
+        var latest = [Double](repeating: 0, count: SpectrumAnalyzer.bandCount)
+        for sample in 0..<(48000 * 4) {
+            let time = Double(sample) / 48000
+            let phase = time.truncatingRemainder(dividingBy: 0.5)
+            let frequency = [52.0, 85, 65, 95][Int(time / 0.5) % 4]
+            let angle = 2 * Double.pi * (frequency * phase + 65 * 0.016 * (1 - exp(-phase / 0.016)))
+            let audio = time < 3.2 ? 0.35 * sin(angle) * exp(-phase / 0.075) * (1 - exp(-phase / 0.001)) : 0
+            if let values = analyzer.feed(Float(audio), sampleRate: 48000) { latest = values }
+            if (sample + 1) % 2400 == 0 { sampledLevels.append(latest) }
+        }
         guard let destination = CGImageDestinationCreateWithURL(gif as CFURL, UTType.gif.identifier as CFString, frames, nil) else { fatalError("GIF destination") }
         CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
         for frame in 0..<frames {
             // A short pause demonstrates that the music notch stays visible.
-            model.music.playing = frame < 34
-            model.music.spectrum.previewLevels((0..<5).map { band in
-                let wave = sin(Double(frame) * 0.69 + Double(band) * 1.8)
-                return 0.2 + 0.72 * abs(wave)
-            })
-            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            model.music.playing = frame < 64
+            model.music.spectrum.previewLevels(sampledLevels[frame])
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
             host.layoutSubtreeIfNeeded()
             let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1440, pixelsHigh: 320,
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -47,13 +56,13 @@ import UniformTypeIdentifiers
             bitmap.size = host.bounds.size
             host.cacheDisplay(in: host.bounds, to: bitmap)
             guard let image = bitmap.cgImage else { fatalError("Frame") }
-            CGImageDestinationAddImage(destination, image, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 0.1]] as CFDictionary)
-            if frame == 12 {
+            CGImageDestinationAddImage(destination, image, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 0.05]] as CFDictionary)
+            if frame == 21 {
                 try bitmap.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent("music-notch.png"))
             }
         }
         guard CGImageDestinationFinalize(destination) else { fatalError("GIF export") }
-        print("Rendered the collapsed music notch with preview spectrum levels")
+        print("Rendered the collapsed music notch with analyzed synthetic bass and a pause")
     }
 }
 

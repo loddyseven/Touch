@@ -3,10 +3,12 @@ import Accelerate
 import CoreAudio
 import Combine
 
-/// Detects low-frequency attacks, then gives all five bars the same beat envelope.
-/// Sustained bass and the vocal bands cannot continuously drive the animation.
+/// Detects bass attacks with overlapping FFT windows. A leading beat pulse and
+/// five measured bass bands move independently, without idle animation.
 final class SpectrumAnalyzer {
     static let size = 2048
+    static let bandCount = 6
+    static let hopSize = 512
     private let setup: vDSP_DFT_Setup?
     private var input = [Float](repeating: 0, count: size)
     private var imaginary = [Float](repeating: 0, count: size)
@@ -14,14 +16,21 @@ final class SpectrumAnalyzer {
     private var imaginaryOutput = [Float](repeating: 0, count: size)
     private var window = [Float](repeating: 0, count: size)
     private var previousMagnitudes = [Double](repeating: 0, count: size / 2)
+    private var history = [Float](repeating: 0, count: size)
     private var index = 0
+    private var filled = 0
+    private var hop = 0
     private var rate: Double = 0
     private var bassFloor = 0.0
     private var previousBass = 0.0
     private var pendingPeak: Double?
     private var pendingAge = 0.0
     private var refractory = 0.0
-    private var envelope = 0.0
+    private var levels = [Double](repeating: 0, count: bandCount)
+    private var beatPresence = 0.0
+    private let bandCenters: [Double] = [45, 65, 90, 120, 155, 200]
+    private let bandWidths: [Double] = [32, 38, 45, 50, 60, 75]
+    private let release: [Double] = [0.105, 0.125, 0.155, 0.18, 0.15, 0.115]
 
     init() {
         setup = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(Self.size), .FORWARD)
@@ -32,17 +41,20 @@ final class SpectrumAnalyzer {
     func feed(_ value: Float, sampleRate: Double) -> [Double]? {
         guard sampleRate.isFinite, sampleRate >= 8_000, sampleRate <= 384_000 else { return nil }
         if rate != sampleRate {
-            rate = sampleRate; index = 0; bassFloor = 0; previousBass = 0
-            pendingPeak = nil; pendingAge = 0; refractory = 0; envelope = 0
+            rate = sampleRate; index = 0; filled = 0; hop = 0; bassFloor = 0; previousBass = 0
+            pendingPeak = nil; pendingAge = 0; refractory = 0; beatPresence = 0
+            levels = Array(repeating: 0, count: Self.bandCount)
             previousMagnitudes = Array(repeating: 0, count: Self.size / 2)
         }
-        input[index] = value.isFinite ? min(4, max(-4, value)) : 0; index += 1
-        guard index == Self.size, let setup else { return nil }
-        index = 0
-        vDSP_vmul(input, 1, window, 1, &input, 1, vDSP_Length(Self.size))
+        history[index] = value.isFinite ? min(4, max(-4, value)) : 0
+        index = (index + 1) % Self.size; filled = min(Self.size, filled + 1); hop += 1
+        guard filled == Self.size, hop >= Self.hopSize, let setup else { return nil }
+        hop = 0
+        for i in 0..<Self.size { input[i] = history[(index + i) % Self.size] * window[i] }
         vDSP_DFT_Execute(setup, input, imaginary, &realOutput, &imaginaryOutput)
-        let dt = Double(Self.size) / sampleRate
+        let dt = Double(Self.hopSize) / sampleRate
         var bassEnergy = 0.0, vocalEnergy = 0.0, flux = 0.0
+        var bands = [Double](repeating: 0, count: Self.bandCount)
         for bin in 1..<(Self.size / 2) {
             let frequency = Double(bin) * sampleRate / Double(Self.size)
             let re = Double(realOutput[bin]), im = Double(imaginaryOutput[bin])
@@ -55,6 +67,12 @@ final class SpectrumAnalyzer {
             } else if frequency > 150 && frequency <= 3500 {
                 vocalEnergy += magnitude * magnitude
             }
+            if frequency >= 25 && frequency <= 275 {
+                for band in 0..<Self.bandCount {
+                    let weight = max(0, 1 - abs(frequency - bandCenters[band]) / bandWidths[band])
+                    bands[band] += magnitude * magnitude * weight
+                }
+            }
             previousMagnitudes[bin] = magnitude
         }
         let bass = sqrt(bassEnergy) * 4 / Double(Self.size)
@@ -65,8 +83,8 @@ final class SpectrumAnalyzer {
         if let peak = pendingPeak {
             pendingAge += dt
             pendingPeak = max(peak, bass)
-            // A kick has an attack followed by a fall. Wait one or two analysis
-            // frames, so a rising/sustained vowel is not treated as a drum hit.
+            // Confirm a falling attack so a rising/sustained vowel is not
+            // treated as a drum hit.
             if bass < peak * 0.84, pendingAge <= 0.15 {
                 hit = min(1, max(0, (20 * log10(max(peak, 0.000001)) + 48) / 38))
                 pendingPeak = nil; refractory = 0.12
@@ -82,14 +100,25 @@ final class SpectrumAnalyzer {
         let floorBlend = 1 - exp(-dt / 0.8)
         bassFloor += (bass - bassFloor) * floorBlend
         previousBass = bass
-        envelope = max(hit, envelope * exp(-dt / 0.14))
-        if envelope < 0.006 { envelope = 0 }
-        return [0.62, 0.84, 1.0, 0.88, 0.66].map { min(1, max(0, envelope * $0)) }
+        beatPresence = max(hit, beatPresence * exp(-dt / 0.32))
+        if beatPresence < 0.006 { beatPresence = 0 }
+        levels[0] = max(hit, levels[0] * exp(-dt / release[0]))
+        for i in 1..<Self.bandCount {
+            // A bass hit opens the body of the waveform. Each remaining bar
+            // follows its own measured band, not a scaled copy of the kick.
+            let amplitude = sqrt(bands[i]) * 4 / Double(Self.size)
+            let body = min(1, max(0, (20 * log10(max(0.000001, amplitude)) + 58) / 43))
+            let target = beatPresence * body * 0.83
+            let response = target > levels[i] ? 0.016 : release[i] * 0.48
+            levels[i] += (target - levels[i]) * (1 - exp(-dt / response))
+        }
+        for i in 0..<Self.bandCount { if levels[i] < 0.006 { levels[i] = 0 } }
+        return levels
     }
 }
 
 @MainActor final class MusicSpectrum: ObservableObject {
-    @Published private(set) var levels = [Double](repeating: 0, count: 5)
+    @Published private(set) var levels = [Double](repeating: 0, count: SpectrumAnalyzer.bandCount)
     @Published private(set) var needsPermission = false
     private var tap: AnyObject?
     private var lastAttempt = Date.distantPast
@@ -97,7 +126,7 @@ final class SpectrumAnalyzer {
     var isFixture = false
     #if TOUCH_SCREENSHOT_FIXTURES
     func previewLevels(_ values: [Double]) {
-        guard isFixture, values.count == 5 else { return }
+        guard isFixture, values.count == SpectrumAnalyzer.bandCount else { return }
         levels = values.map { $0.isFinite ? min(1, max(0, $0)) : 0 }
     }
     #endif
@@ -121,7 +150,7 @@ final class SpectrumAnalyzer {
     func stop() {
         generation += 1
         if #available(macOS 14.2, *), let tap = tap as? YandexAudioTap { tap.stop() }
-        tap = nil; levels = Array(repeating: 0, count: 5)
+        tap = nil; levels = Array(repeating: 0, count: SpectrumAnalyzer.bandCount)
     }
     func retry() { needsPermission = false; lastAttempt = .distantPast; start() }
 }

@@ -12,13 +12,13 @@
 
 Нативное приложение на SwiftUI и AppKit. Открывается по наведению, сворачивается обратно в чёлку и оставляет нужное под рукой.
 
-[Видео: Touch за 30 секунд](https://github.com/loddyseven/Touch/releases/download/v2.4.11/Touch-30s-Vertical.mp4) · [Скачать Touch для Apple Silicon](https://github.com/loddyseven/Touch/releases/latest)
+[Видео: Touch за 30 секунд](https://github.com/loddyseven/Touch/releases/download/v2.4.12/Touch-30s-Vertical.mp4) · [Скачать Touch для Apple Silicon](https://github.com/loddyseven/Touch/releases/latest)
 
 ## Интерфейс
 
 ### Музыка
 
-В свёрнутом виде Touch оставляет обложку слева от чёлки и визуализатор справа. Его цвет подстраивается под обложку, а полоски пульсируют на басовых ударах. На паузе чёлка остаётся на месте.
+В свёрнутом виде Touch оставляет обложку слева от чёлки и визуализатор справа. Его цвет подстраивается под обложку. Шесть тонких полосок реагируют на бас: первая подчёркивает удар, остальные показывают разные частоты с плавным спадом. На паузе чёлка остаётся на месте.
 
 ![Свёрнутая чёлка Touch во время музыки и на паузе](docs/images/music-notch.gif)
 

@@ -277,12 +277,12 @@ struct MusicWave: View {
     var color: Color
     @Environment(\.accessibilityReduceMotion) private var reduced
     var body: some View {
-        HStack(alignment: .center, spacing: 2.3) {
-            ForEach(0..<5) { i in
-                Capsule().fill(color).frame(width: 3,
-                    height: active && !reduced ? 4 + 13 * spectrum.levels[i] : 4)
+        HStack(alignment: .center, spacing: 1.8) {
+            ForEach(0..<SpectrumAnalyzer.bandCount, id: \.self) { i in
+                Capsule().fill(color).frame(width: 2.5,
+                    height: active && !reduced ? 3 + 20 * spectrum.levels[i] : 3)
             }
-        }.frame(height: 20).animation(reduced ? nil : .linear(duration: 0.055), value: spectrum.levels)
+        }.frame(height: 24).animation(reduced ? nil : .easeOut(duration: 0.035), value: spectrum.levels)
             .animation(reduced ? nil : .easeOut(duration: 0.4), value: color).accessibilityHidden(true)
     }
 

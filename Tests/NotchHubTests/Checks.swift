@@ -194,7 +194,7 @@ enum Checks {
         for rate in [44100.0, 48000, 96000] {
             let result = analyze(rate: rate, signal: { kick($0) })
             check(result.hits.count == 6, "Six kick attacks produce six pulses at \(Int(rate)) Hz")
-            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.15 }, "Beat detection stays within 150ms at \(Int(rate)) Hz")
+            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.09 }, "Beat detection stays within 90ms at \(Int(rate)) Hz")
             check(result.last < 0.13, "Beat envelope settles between drum hits at \(Int(rate)) Hz")
         }
         let quiet = analyze(signal: { kick($0, amplitude: 0.06) })
@@ -219,6 +219,40 @@ enum Checks {
             if let levels = invalid.feed(.infinity, sampleRate: 48000) { finite = finite && levels.allSatisfy { $0.isFinite && $0 == 0 } }
         }
         check(finite, "Nonfinite input samples cannot animate or poison the analyzer")
+        func bandResponse(frequency: Double) -> [Double] {
+            let analyzer = SpectrumAnalyzer()
+            var response = [Double](repeating: 0, count: SpectrumAnalyzer.bandCount)
+            for sample in 0..<48000 {
+                let phase = (Double(sample) / 48000).truncatingRemainder(dividingBy: 0.5)
+                let value = 0.4 * sin(2 * Double.pi * frequency * phase) * exp(-phase / 0.07) * (1 - exp(-phase / 0.001))
+                if let levels = analyzer.feed(Float(value), sampleRate: 48000) {
+                    for band in response.indices { response[band] += levels[band] }
+                }
+            }
+            return response
+        }
+        let lowBand = bandResponse(frequency: 45), upperBand = bandResponse(frequency: 85)
+        check(lowBand.count == 6 && upperBand.count == 6, "Every analysis result supplies all six visible bars")
+        check(upperBand[4] / upperBand[1] > 4 * lowBand[4] / lowBand[1], "A change in bass frequency changes the bar pattern, not just overall height")
+        let cadence = SpectrumAnalyzer()
+        var updates = 0, settled = false
+        for sample in 0..<48000 {
+            if let levels = cadence.feed(Float(kick(Double(sample) / 48000)), sampleRate: 48000) {
+                updates += 1
+                settled = levels.allSatisfy { $0.isFinite && (0...1).contains($0) }
+                if !settled { break }
+            }
+        }
+        check(updates >= 60 && settled, "Bass animation receives bounded levels at least 60 times per second")
+        var changedRate: [Double] = []
+        for _ in 0..<4096 {
+            if let levels = cadence.feed(0, sampleRate: 44100) { changedRate = levels }
+        }
+        check(changedRate.count == 6 && changedRate.allSatisfy { $0 == 0 }, "Changing audio sample rate clears the previous beat and FFT history")
+        let spectrum = MusicSpectrum()
+        spectrum.isFixture = true
+        spectrum.stop()
+        check(spectrum.levels.count == 6 && spectrum.levels.allSatisfy { $0 == 0 }, "Stopping analysis leaves six resting bars")
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 32, bitsPerPixel: 32)!
         for offset in stride(from: 0, to: 8 * 8 * 4, by: 4) {
             bitmap.bitmapData![offset] = 204
