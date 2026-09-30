@@ -1,0 +1,14 @@
+.build/
+dist/
+.DS_Store
+artifacts/
+review/
+.swiftpm/
+.env
+.env.*
+*.log
+*.xcuserstate
+xcuserdata/
+# Local design assets; the current interface uses system icons and emoji.
+/Resources/*.png
+/scripts/render-bright-ui.swift

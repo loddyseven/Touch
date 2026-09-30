@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>ru</string>
+	<key>CFBundleDisplayName</key>
+	<string>Touch</string>
+	<key>CFBundleExecutable</key>
+	<string>NotchHub</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.notchhub.air</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Touch</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.4.9</string>
+	<key>CFBundleVersion</key>
+	<string>25</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Touch анализирует музыку для визуализации и добавляет звук Mac в запись экрана, только если включён этот параметр. Аудио не отправляется.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Touch показывает системные скриншоты, сделанные через ⌘⇧3 и ⌘⇧4, в чёлке. Другие файлы на рабочем столе не добавляются.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Touch подхватывает системные скриншоты, если эта папка выбрана местом их сохранения в macOS.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Touch подхватывает системные скриншоты, если эта папка выбрана местом их сохранения в macOS.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Touch · Personal utility</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Touch записывает выбранную область или экран в видео только после нажатия «Начать запись».</string>
+</dict>
+</plist>
