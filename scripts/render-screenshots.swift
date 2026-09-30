@@ -21,28 +21,16 @@ import SwiftUI
         // Fixtures are never written to the user's shelf or playback state.
         model.shelf.add([pdf, zip])
         model.music.isFixture = true; model.music.connected = true; model.music.permissionNeeded = false
-        model.music.playing = true; model.music.title = "Night Drive"; model.music.artist = "Touch Sessions"
-        model.music.elapsed = 43; model.music.duration = 195
-        let cover = ImageRenderer(content:
-            LinearGradient(colors: [Color(red: 0.11, green: 0.08, blue: 0.28), Color(red: 0.68, green: 0.26, blue: 0.59), Color(red: 1, green: 0.6, blue: 0.39)], startPoint: .top, endPoint: .bottomTrailing)
-                .frame(width: 320, height: 320)
-                .overlay(alignment: .topTrailing) { Circle().fill(Color(red: 1, green: 0.72, blue: 0.39)).frame(width: 135, height: 135).padding(35) }
-                .overlay(alignment: .bottom) { Ellipse().fill(Color(red: 0.08, green: 0.09, blue: 0.24)).frame(width: 510, height: 235).rotationEffect(.degrees(-24)).offset(x: -45, y: 90) }
-                .overlay(alignment: .bottomLeading) { VStack(alignment: .leading, spacing: -6) { Text("NIGHT"); Text("DRIVE") }.font(.system(size: 45, weight: .black)).foregroundStyle(.white).padding(24) }.clipped())
-        cover.scale = 2; model.music.artwork = cover.nsImage
-        let names = ["Afterglow", "Slow Motion", "Night Drive"]
-        for (index, title) in names.enumerated() {
-            let artwork = ImageRenderer(content:
-                LinearGradient(colors: [Color(hue: Double(index) * 0.24 + 0.05, saturation: 0.75, brightness: 0.85), .black], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    .frame(width: 320, height: 320)
-                    .overlay { Circle().stroke(.white.opacity(0.7), lineWidth: 3).frame(width: 175, height: 175) }
-                    .overlay(alignment: .bottomLeading) { Text(title.uppercased()).font(.system(size: 26, weight: .black)).foregroundStyle(.white).padding(22) })
-            model.music.title = title; model.music.duration = Double(182 + index * 7)
-            model.music.artwork = index == 2 ? cover.nsImage : artwork.nsImage
-            model.music.recordCurrentTrack()
-        }
-        model.music.title = "Night Drive"; model.music.duration = 195; model.music.elapsed = 43
-        if let data = cover.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) {
+        model.music.playing = true
+        model.music.title = "Общество Мертвых Поэтов"; model.music.artist = "VILLIAN, Aarne"
+        model.music.elapsed = 80; model.music.duration = 126
+        // Album artwork matching the supplied music screenshot.
+        let artworkURL = URL(string: "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/1f/72/90/1f729078-0a21-ede0-5246-f501f51a7339/cover.jpg/600x600bb.jpg")!
+        let artworkSource = CommandLine.arguments.count > 2 ? URL(fileURLWithPath: CommandLine.arguments[2]) : artworkURL
+        guard let cover = NSImage(data: try Data(contentsOf: artworkSource)) else { fatalError("Album artwork unavailable") }
+        model.music.artwork = cover
+        model.music.recordCurrentTrack()
+        if let data = cover.tiffRepresentation, let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) {
             let url = fixtures.appendingPathComponent("Обложка.png")
             try png.write(to: url); model.shelf.add([url])
         }
