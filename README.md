@@ -1,6 +1,36 @@
-# Touch
+<h1 align="center">Touch</h1>
 
-Панель у чёлки MacBook: музыка, файлы, снимки экрана и буфер обмена в одном месте. Написана на SwiftUI и AppKit.
+<p align="center">Музыка, файлы и снимки экрана — у чёлки MacBook.</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-14%2B-18181B?style=flat-square&amp;logo=apple&amp;logoColor=white" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-6-F05138?style=flat-square&amp;logo=swift&amp;logoColor=white" alt="Swift 6">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-34D399?style=flat-square" alt="MIT License"></a>
+</p>
+
+![Главная панель Touch](docs/images/home.png)
+
+Нативное приложение на SwiftUI и AppKit. Открывается по наведению, сворачивается обратно в чёлку и оставляет нужное под рукой.
+
+## Интерфейс
+
+### Музыка
+
+Обложка, перемотка, управление воспроизведением и три недавно прослушанных трека.
+
+![Музыка в Touch](docs/images/music.png)
+
+### Снимки и запись экрана
+
+Два действия слева, галерея справа. Системные скриншоты тоже попадают сюда.
+
+![Снимки в Touch](docs/images/captures.png)
+
+### Файлы
+
+Выделение рамкой, действия по правому клику и перетаскивание всей группы.
+
+![Выделение файлов в Touch](docs/images/files.png)
 
 ## Возможности
 
