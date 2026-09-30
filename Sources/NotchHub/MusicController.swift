@@ -340,8 +340,16 @@ final class MusicController: ObservableObject {
             guard let self else { return }
             defer { self.startingRecentID = nil; self.recentPlaybackTask = nil }
             var searchPrepared = false
-            for _ in 0..<24 {
-                do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+            var attempt = RecentPlaybackAttempt(track: track, started: Date())
+            while !attempt.timedOut(at: Date()) {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                let snapshot: MusicSnapshot? = await withCheckedContinuation { continuation in
+                    self.queue.async { continuation.resume(returning: YandexAccessibility.read(pid: pid, fresh: true)) }
+                }
+                if attempt.confirmed(by: snapshot) { self.message = nil; self.refresh(); return }
+                // Electron replaces the player while loading. Keep observing the
+                // new player instead of pressing the result again or failing at 2.5s.
+                if attempt.pressedAt != nil { continue }
                 if !searchPrepared {
                     let prepared: Bool = await withCheckedContinuation { continuation in
                         self.queue.async { continuation.resume(returning: YandexAccessibility.prepareRecentSearch(pid: pid, track: track)) }
@@ -355,17 +363,12 @@ final class MusicController: ObservableObject {
                     }
                 }
                 if success {
-                    for _ in 0..<10 {
-                        do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
-                        let snapshot: MusicSnapshot? = await withCheckedContinuation { continuation in
-                            self.queue.async { continuation.resume(returning: YandexAccessibility.read(pid: pid)) }
-                        }
-                        if let snapshot, snapshot.playing, track.agrees(with: snapshot) { self.message = nil; self.refresh(); return }
-                    }
-                    break
+                    attempt.didPress(at: Date())
                 }
             }
-            self.message = "Яндекс Музыка не подтвердила запуск выбранного трека"
+            self.message = attempt.pressedAt == nil
+                ? "Не удалось найти этот трек в Яндекс Музыке"
+                : "Яндекс Музыка не запустила трек. Попробуй ещё раз после загрузки плеера."
         }
     }
 
@@ -421,7 +424,8 @@ private enum YandexAccessibility {
         }
         cachedPlayer = nil; return nil
     }
-    static func read(pid: pid_t) -> MusicSnapshot? {
+    static func read(pid: pid_t, fresh: Bool = false) -> MusicSnapshot? {
+        if fresh { cachedPlayer = nil }
         guard let player = player(pid: pid) else { return nil }
         let nodes = descendants(player, limit: 220)
         var result = MusicSnapshot(), texts: [String] = [], linkedArtists: [String] = []
@@ -569,7 +573,9 @@ private enum YandexAccessibility {
                     candidate.duration = nodes.compactMap { RecentMusicTrack.accessibilityDuration(label($0)) }.first ?? 0
                     guard track.matchesSearchResult(candidate) else { continue }
                     if let play = nodes.first(where: { value($0, kAXRoleAttribute) as? String == kAXButtonRole && ["Воспроизведение", "Play"].contains(label($0)) }) {
-                        return AXUIElementPerformAction(play, kAXPressAction as CFString) == .success
+                        let pressed = AXUIElementPerformAction(play, kAXPressAction as CFString) == .success
+                        if pressed { cachedPlayer = nil }
+                        return pressed
                     }
                     if nodes.contains(where: { value($0, kAXRoleAttribute) as? String == kAXButtonRole && ["Пауза", "Pause"].contains(label($0)) }) { return true }
                 }

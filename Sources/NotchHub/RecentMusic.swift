@@ -20,13 +20,18 @@ struct RecentMusicTrack: Identifiable {
     }
 
     func matchesSearchResult(_ snapshot: MusicSnapshot) -> Bool {
-        guard agrees(with: snapshot) else { return false }
         if let expected = trackID, let actual = snapshot.trackID, expected != actual { return false }
         let exactID = trackID != nil && trackID == snapshot.trackID
+        if exactID { return true }
+        guard agrees(with: snapshot) else { return false }
         if !exactID, let expected = albumID, let actual = snapshot.albumID, expected != actual { return false }
         // Electron sometimes omits the query from AXURL. A complete title/artist/
         // duration tuple still identifies the result without opening its link.
         return exactID || duration <= 0 || snapshot.duration > 0
+    }
+
+    func confirmsPlayback(_ snapshot: MusicSnapshot) -> Bool {
+        snapshot.playing && matchesSearchResult(snapshot)
     }
 
     static func accessibilityDuration(_ label: String) -> Double? {
@@ -60,6 +65,23 @@ struct RecentMusicTrack: Identifiable {
         return !snapshot.artist.isEmpty && normalized(title) == normalized(snapshot.title) &&
             artists(artist) == artists(snapshot.artist) &&
             (duration <= 0 || snapshot.duration <= 0 || abs(duration - snapshot.duration) < 2)
+    }
+}
+
+/// Search and playback loading have separate deadlines. Sending AXPress is not
+/// playback confirmation, and a slow load must never send a second toggle.
+struct RecentPlaybackAttempt {
+    let track: RecentMusicTrack
+    let started: Date
+    private(set) var pressedAt: Date?
+
+    mutating func didPress(at date: Date) { if pressedAt == nil { pressedAt = date } }
+    func timedOut(at date: Date) -> Bool {
+        if let pressedAt { return date.timeIntervalSince(pressedAt) >= 12 }
+        return date.timeIntervalSince(started) >= 15
+    }
+    func confirmed(by snapshot: MusicSnapshot?) -> Bool {
+        snapshot.map(track.confirmsPlayback) ?? false
     }
 }
 

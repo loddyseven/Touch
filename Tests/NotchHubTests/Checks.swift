@@ -142,6 +142,19 @@ enum Checks {
         check(RecentMusicTrack.accessibilityDuration("2:03") == 123 && RecentMusicTrack.accessibilityDuration("1:02:03") == 3723, "Clock-shaped durations")
         check(RecentMusicTrack.accessibilityDuration("FLOCKAA Сутки") == nil, "A track name is not mistaken for duration")
 
+        check(recentWithID.confirmsPlayback(MusicSnapshot(playing: true, trackID: "34")), "A playing track ID confirms startup while artist and duration are still loading")
+        check(!recentWithID.confirmsPlayback(MusicSnapshot(title: "Сутки", artist: "FLOCKAA", playing: true, duration: 116, trackID: "999")), "Stale same-title metadata cannot confirm a different playing ID")
+        check(!recentWithID.confirmsPlayback(MusicSnapshot(title: "Сутки", artist: "FLOCKAA", duration: 116, trackID: "34")), "A paused target is not reported as playing")
+        check(!recentWithID.confirmsPlayback(MusicSnapshot(title: "Сутки", playing: true)), "Incomplete metadata without an ID cannot confirm playback")
+        let playbackStart = Date(timeIntervalSince1970: 1000)
+        var attempt = RecentPlaybackAttempt(track: recentWithID, started: playbackStart)
+        check(!attempt.timedOut(at: playbackStart.addingTimeInterval(10)), "Search gets a bounded loading interval")
+        attempt.didPress(at: playbackStart.addingTimeInterval(11))
+        attempt.didPress(at: playbackStart.addingTimeInterval(20))
+        check(attempt.pressedAt == playbackStart.addingTimeInterval(11), "Duplicate action completion cannot extend the playback deadline")
+        check(!attempt.timedOut(at: playbackStart.addingTimeInterval(19)) && attempt.confirmed(by: MusicSnapshot(playing: true, trackID: "34")), "A delayed eight-second load confirms playback instead of timing out after 2.5 seconds")
+        check(attempt.timedOut(at: playbackStart.addingTimeInterval(23)), "A player that never starts still times out")
+
         music.artist = "Fixture artist"
         music.connected = true; music.recordCurrentTrack()
         check(music.recentTracks.first?.title == "Seek fixture", "The collection shows observed track metadata")
@@ -159,19 +172,53 @@ enum Checks {
     }
 
     private static func spectrumChecks() {
-        func analyze(_ frequency: Double, amplitude: Double = 0.35) -> [Double] {
-            let analyzer = SpectrumAnalyzer(); var bands = [Double]()
-            for i in 0..<(SpectrumAnalyzer.size * 8) {
-                if let result = analyzer.feed(Float(amplitude * sin(2 * .pi * frequency * Double(i) / 48000)), sampleRate: 48000) { bands = result }
+        func analyze(rate: Double = 48000, signal: (Double) -> Double) -> (peak: Double, hits: [Double], last: Double) {
+            let analyzer = SpectrumAnalyzer(); var peak = 0.0, last = 0.0, hits: [Double] = []
+            for sample in 0..<Int(rate * 3) {
+                let time = Double(sample) / rate
+                if let values = analyzer.feed(Float(signal(time)), sampleRate: rate) {
+                    let level = values.max() ?? 0
+                    peak = max(peak, level)
+                    if level > last + 0.12 { hits.append(time) }
+                    last = level
+                }
             }
-            return bands
+            return (peak, hits, last)
         }
-        for (band, frequency) in [100.0, 320, 900, 2600, 8500].enumerated() {
-            let values = analyze(frequency)
-            check(values.indices.max(by: { values[$0] < values[$1] }) == band, "Audio frequency \(Int(frequency)) Hz drives its own band")
+        func kick(_ time: Double, amplitude: Double = 0.4) -> Double {
+            let phase = time.truncatingRemainder(dividingBy: 0.5)
+            guard phase < 0.3 else { return 0 }
+            let angle = 2 * Double.pi * (52 * phase + 80 * 0.016 * (1 - exp(-phase / 0.016)))
+            return amplitude * sin(angle) * exp(-phase / 0.075) * (1 - exp(-phase / 0.001))
         }
-        check(analyze(900, amplitude: 0.3)[2] > analyze(900, amplitude: 0.02)[2], "Louder audio increases the visualizer level")
-        check(analyze(0, amplitude: 0).allSatisfy { $0 == 0 }, "Silence produces no artificial movement")
+        for rate in [44100.0, 48000, 96000] {
+            let result = analyze(rate: rate, signal: { kick($0) })
+            check(result.hits.count == 6, "Six kick attacks produce six pulses at \(Int(rate)) Hz")
+            check(result.hits.enumerated().allSatisfy { $0.element - Double($0.offset) * 0.5 < 0.15 }, "Beat detection stays within 150ms at \(Int(rate)) Hz")
+            check(result.last < 0.13, "Beat envelope settles between drum hits at \(Int(rate)) Hz")
+        }
+        let quiet = analyze(signal: { kick($0, amplitude: 0.06) })
+        check(quiet.hits.count == 6 && quiet.peak < analyze(signal: { kick($0) }).peak, "Quiet kicks remain visible without reaching the loud-hit peak")
+        let voice = analyze(signal: { time in
+            let amplitude = 0.45 + 0.25 * sin(2 * Double.pi * 4 * time)
+            return amplitude * (0.5 * sin(2 * .pi * 175 * time) + 0.3 * sin(2 * .pi * 350 * time) + 0.2 * sin(2 * .pi * 700 * time))
+        })
+        check(voice.peak < 0.01, "Modulated vocal-range harmonics do not drive the beat bars")
+        let lowVoice = analyze(signal: { time in
+            let amplitude = 0.45 + 0.25 * sin(2 * Double.pi * 4 * time)
+            return amplitude * (0.35 * sin(2 * .pi * 90 * time) + 0.4 * sin(2 * .pi * 180 * time) + 0.25 * sin(2 * .pi * 360 * time))
+        })
+        check(lowVoice.peak < 0.01, "A low vocal fundamental with speech harmonics is rejected")
+        check(analyze(signal: { 0.4 * sin(2 * .pi * 65 * $0) }).peak < 0.01, "Sustained bass does not create artificial beats")
+        check(analyze(signal: { kick($0) + 0.18 * sin(2 * .pi * 175 * $0) + 0.14 * sin(2 * .pi * 350 * $0) }).hits.count == 6, "Kick attacks remain detectable under vocal-range harmonics")
+        check(analyze(signal: { _ in 0 }).peak == 0, "Silence produces no artificial movement")
+        let invalid = SpectrumAnalyzer()
+        check(invalid.feed(1, sampleRate: .nan) == nil && invalid.feed(1, sampleRate: 0) == nil, "Invalid sample rates never reach FFT bin conversion")
+        var finite = true
+        for _ in 0..<(SpectrumAnalyzer.size * 3) {
+            if let levels = invalid.feed(.infinity, sampleRate: 48000) { finite = finite && levels.allSatisfy { $0.isFinite && $0 == 0 } }
+        }
+        check(finite, "Nonfinite input samples cannot animate or poison the analyzer")
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 32, bitsPerPixel: 32)!
         for offset in stride(from: 0, to: 8 * 8 * 4, by: 4) {
             bitmap.bitmapData![offset] = 204

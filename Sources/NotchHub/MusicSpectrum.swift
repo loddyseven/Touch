@@ -3,7 +3,8 @@ import Accelerate
 import CoreAudio
 import Combine
 
-/// A bounded FFT over in-memory samples. It never writes or transmits audio.
+/// Detects low-frequency attacks, then gives all five bars the same beat envelope.
+/// Sustained bass and the vocal bands cannot continuously drive the animation.
 final class SpectrumAnalyzer {
     static let size = 2048
     private let setup: vDSP_DFT_Setup?
@@ -12,35 +13,78 @@ final class SpectrumAnalyzer {
     private var realOutput = [Float](repeating: 0, count: size)
     private var imaginaryOutput = [Float](repeating: 0, count: size)
     private var window = [Float](repeating: 0, count: size)
+    private var previousMagnitudes = [Double](repeating: 0, count: size / 2)
     private var index = 0
-    private var smooth = [Double](repeating: 0, count: 5)
+    private var rate: Double = 0
+    private var bassFloor = 0.0
+    private var previousBass = 0.0
+    private var pendingPeak: Double?
+    private var pendingAge = 0.0
+    private var refractory = 0.0
+    private var envelope = 0.0
+
     init() {
         setup = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(Self.size), .FORWARD)
         vDSP_hann_window(&window, vDSP_Length(Self.size), Int32(vDSP_HANN_NORM))
     }
     deinit { if let setup { vDSP_DFT_DestroySetup(setup) } }
+
     func feed(_ value: Float, sampleRate: Double) -> [Double]? {
-        input[index] = value.isFinite ? value : 0; index += 1
+        guard sampleRate.isFinite, sampleRate >= 8_000, sampleRate <= 384_000 else { return nil }
+        if rate != sampleRate {
+            rate = sampleRate; index = 0; bassFloor = 0; previousBass = 0
+            pendingPeak = nil; pendingAge = 0; refractory = 0; envelope = 0
+            previousMagnitudes = Array(repeating: 0, count: Self.size / 2)
+        }
+        input[index] = value.isFinite ? min(4, max(-4, value)) : 0; index += 1
         guard index == Self.size, let setup else { return nil }
         index = 0
         vDSP_vmul(input, 1, window, 1, &input, 1, vDSP_Length(Self.size))
         vDSP_DFT_Execute(setup, input, imaginary, &realOutput, &imaginaryOutput)
-        let edges: [Double] = [45, 180, 500, 1500, 4500, 14000]
-        for band in 0..<5 {
-            let low = max(1, Int(edges[band] * Double(Self.size) / sampleRate))
-            let high = min(Self.size / 2 - 1, Int(edges[band+1] * Double(Self.size) / sampleRate))
-            var energy: Float = 0
-            if high >= low {
-                for bin in low...high { energy += realOutput[bin]*realOutput[bin] + imaginaryOutput[bin]*imaginaryOutput[bin] }
+        let dt = Double(Self.size) / sampleRate
+        var bassEnergy = 0.0, vocalEnergy = 0.0, flux = 0.0
+        for bin in 1..<(Self.size / 2) {
+            let frequency = Double(bin) * sampleRate / Double(Self.size)
+            let re = Double(realOutput[bin]), im = Double(imaginaryOutput[bin])
+            let magnitude = sqrt(re * re + im * im)
+            if frequency >= 35 && frequency <= 150 {
+                // Most voice fundamentals and their formants sit above the kick's body.
+                let weight = frequency <= 95 ? 1.0 : 0.3 * (150 - frequency) / 55
+                bassEnergy += magnitude * magnitude * weight
+                flux += max(0, magnitude - previousMagnitudes[bin]) * weight
+            } else if frequency > 150 && frequency <= 3500 {
+                vocalEnergy += magnitude * magnitude
             }
-            let amplitude = sqrt(Double(energy)) * 4 / Double(Self.size)
-            let decibels = 20 * log10(max(0.000001, amplitude))
-            let target = min(1, max(0, (decibels + 56) / 48))
-            let speed = target > smooth[band] ? 0.76 : 0.22
-            smooth[band] += (target - smooth[band]) * speed
-            if smooth[band] < 0.006 { smooth[band] = 0 }
+            previousMagnitudes[bin] = magnitude
         }
-        return smooth
+        let bass = sqrt(bassEnergy) * 4 / Double(Self.size)
+        let fluxAmplitude = flux * 4 / Double(Self.size)
+        let bassShare = bassEnergy / max(0.000001, bassEnergy + vocalEnergy)
+        var hit = 0.0
+        refractory = max(0, refractory - dt)
+        if let peak = pendingPeak {
+            pendingAge += dt
+            pendingPeak = max(peak, bass)
+            // A kick has an attack followed by a fall. Wait one or two analysis
+            // frames, so a rising/sustained vowel is not treated as a drum hit.
+            if bass < peak * 0.84, pendingAge <= 0.15 {
+                hit = min(1, max(0, (20 * log10(max(peak, 0.000001)) + 48) / 38))
+                pendingPeak = nil; refractory = 0.12
+            } else if pendingAge > 0.15 {
+                pendingPeak = nil
+            }
+        }
+        if pendingPeak == nil, hit == 0, refractory == 0,
+           bass > max(0.008, bassFloor * 1.45), bass > previousBass * 1.18,
+           fluxAmplitude > bass * 0.22, bassShare > 0.45 {
+            pendingPeak = bass; pendingAge = 0
+        }
+        let floorBlend = 1 - exp(-dt / 0.8)
+        bassFloor += (bass - bassFloor) * floorBlend
+        previousBass = bass
+        envelope = max(hit, envelope * exp(-dt / 0.14))
+        if envelope < 0.006 { envelope = 0 }
+        return [0.62, 0.84, 1.0, 0.88, 0.66].map { min(1, max(0, envelope * $0)) }
     }
 }
 
@@ -114,7 +158,7 @@ private final class YandexAudioTap {
         let ids = Self.processes()
         guard !ids.isEmpty else { throw Failure(code: kAudioHardwareBadObjectError) }
         let description = CATapDescription(stereoMixdownOfProcesses: ids)
-        description.name = "Touch — Yandex Music spectrum"
+        description.name = "Touch — Yandex Music beat"
         description.isPrivate = true; description.muteBehavior = .unmuted
         if #available(macOS 26.0, *) { description.isProcessRestoreEnabled = true }
         var result = AudioHardwareCreateProcessTap(description, &tapID)
