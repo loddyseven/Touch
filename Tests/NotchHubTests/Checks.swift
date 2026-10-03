@@ -329,6 +329,40 @@ enum Checks {
             }
             check(interference < 0.02 && bassPeak > 0.3,
                   "Bass pulses do not pump sustained melody and treble at \(Int(rate))Hz")
+            for (offset, frequency) in [220.0, 650, 1800, 4500, 10500].enumerated() {
+                let band = offset + 1
+                let quiet = SpectrumAnalyzer(), mixed = SpectrumAnalyzer()
+                var total = 0.0, frames = 0, onset: Double?, difference = 0.0
+                var frame = [Double](repeating: 0, count: 6)
+                for sample in 0..<Int(rate * 0.7) {
+                    let time = Double(sample) / rate
+                    let note = time < 0.1 ? 0 : 0.004 * sin(2 * .pi * frequency * (time - 0.1))
+                    if let values = quiet.feed(Float(note), sampleRate: rate) {
+                        frame = values
+                        if onset == nil, values[band] > 0.1 { onset = time }
+                        if time > 0.25 { total += values[band]; frames += 1 }
+                    }
+                    // A smooth bass tone stays in the low range; a sharp
+                    // kick attack itself also contains real midrange energy.
+                    let bass = 0.4 * sin(2 * .pi * 65 * time) * (0.6 + 0.4 * sin(2 * .pi * 3 * time))
+                    if let values = mixed.feed(Float(note + bass), sampleRate: rate), time > 0.25 {
+                        difference = max(difference, abs(values[band] - frame[band]))
+                    }
+                }
+                check(total / Double(frames) > 0.13 && onset != nil && onset! - 0.1 < 0.04,
+                      "A quiet \(Int(frequency))Hz note remains visible within 40ms at \(Int(rate))Hz")
+                if band >= 2 {
+                    check(difference < 0.03, "Loud bass does not mask or pump a quiet \(Int(frequency))Hz note at \(Int(rate))Hz")
+                }
+            }
+            let noise = SpectrumAnalyzer()
+            var seed: UInt64 = 19, noisePeak = 0.0
+            for _ in 0..<Int(rate * 0.5) {
+                seed = seed &* 6364136223846793005 &+ 1
+                let sample = Float((Double(seed >> 32) / Double(UInt32.max) * 2 - 1) * 0.00003)
+                if let values = noise.feed(sample, sampleRate: rate) { noisePeak = max(noisePeak, values.max() ?? 0) }
+            }
+            check(noisePeak == 0, "Extra sensitivity does not animate near-silent noise at \(Int(rate))Hz")
         }
         let splitStereo = StereoSpectrumAnalyzer()
         var splitResponse = [Double](repeating: 0, count: 6)

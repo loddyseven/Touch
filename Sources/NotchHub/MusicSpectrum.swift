@@ -37,7 +37,10 @@ final class SpectrumAnalyzer {
     private var percussionCooldown = [Double](repeating: 0, count: 2)
     private var percussionAttack = [Double](repeating: 0, count: 2)
     private var previousBands = [Double](repeating: 0, count: bandCount)
-    private let musicWeight: [Double] = [0.60, 0.40, 0.36, 0.36, 0.50, 0.58]
+    private let musicWeight: [Double] = [0.60, 0.48, 0.42, 0.42, 0.50, 0.70]
+    // Higher ranges carry much less energy than bass in a mixed track. Keep
+    // separate sensitivity curves so quiet notes do not collapse into 1px.
+    private let sensitivity: [Double] = [0.08, 0.016, 0.012, 0.009, 0.006, 0.0035]
     private(set) var beatStrength = 0.0
     private let release: [Double] = [0.06, 0.055, 0.075, 0.08, 0.07, 0.045]
 
@@ -121,8 +124,12 @@ final class SpectrumAnalyzer {
             if band >= 0 {
                 let power = magnitude * magnitude
                 let previous = previousMagnitudes[bin]
-                bands[band] += power
-                bandFlux[band] += max(0, power - previous * previous)
+                // The short FFT spreads low bass into its neighbouring bin.
+                // Taper that edge before increasing low-mid sensitivity.
+                let edge = band == 1 ? min(1, (frequency - bandEdges[1]) / 90) : 1
+                let weight = edge * edge * edge
+                bands[band] += power * weight
+                bandFlux[band] += max(0, power - previous * previous) * weight
             }
             previousMagnitudes[bin] = magnitude
         }
@@ -172,12 +179,14 @@ final class SpectrumAnalyzer {
         previousBass = bass
         beatStrength = hit
         for i in 0..<Self.bandCount {
-            let amplitude = sqrt(bands[i]) * 4 / Double(fftSize)
+            let measured = sqrt(bands[i]) * 4 / Double(fftSize)
+            let amplitude = i == 0 ? measured : max(0, measured - 0.0003)
             // Continuous voice and melody remain visible independently of
             // percussion. Never multiply every band by one shared beat envelope.
-            let musicalBody = amplitude / (amplitude + 0.08)
-            let rise = max(0, amplitude - previousBands[i]) / max(0.008, amplitude)
-            let noteAccent = min((1...3).contains(i) ? 0.08 : 0.16, rise * musicalBody * 0.22)
+            let musicalBody = amplitude / (amplitude + sensitivity[i])
+            let rise = max(0, amplitude - previousBands[i]) / max(i == 0 ? 0.008 : 0.001, amplitude)
+            let accentLimit = i == 1 ? 0.06 : ((2...4).contains(i) ? 0.08 : 0.16)
+            let noteAccent = min(accentLimit, rise * musicalBody * (i == 0 ? 0.22 : 0.32))
             let percussion: Double
             switch i {
             case 2: percussion = percussionHits[0]
