@@ -27,15 +27,17 @@ final class SpectrumAnalyzer {
     private var refractory = 0.0
     private var levels = [Double](repeating: 0, count: bandCount)
     private var displayLevels = [Double](repeating: 0, count: bandCount)
-    private var beatPresence = 0.0
-    private let bandCenters: [Double] = [45, 65, 140, 700, 3200, 9000]
-    private let bandWidths: [Double] = [32, 50, 90, 900, 2400, 7000]
+    // Bass, low mids, voice/body, upper mids, presence, and treble. Each FFT
+    // bin belongs to one range instead of driving overlapping bass bars.
+    private let bandEdges: [Double] = [25, 130, 350, 1000, 3000, 7000, 16000]
+    private var binBands = [Int](repeating: -1, count: size / 2)
+    private var bandAccents = [Double](repeating: 0, count: bandCount)
     private var percussionFloor = [Double](repeating: 0, count: 2)
     private var previousPercussion = [Double](repeating: 0, count: 2)
     private var percussionCooldown = [Double](repeating: 0, count: 2)
     private var percussionAttack = [Double](repeating: 0, count: 2)
     private var previousBands = [Double](repeating: 0, count: bandCount)
-    private let musicWeight: [Double] = [0.40, 0.55, 0.32, 0.30, 0.40, 0.55]
+    private let musicWeight: [Double] = [0.60, 0.40, 0.36, 0.36, 0.50, 0.58]
     private(set) var beatStrength = 0.0
     private let release: [Double] = [0.06, 0.055, 0.075, 0.08, 0.07, 0.045]
 
@@ -68,12 +70,17 @@ final class SpectrumAnalyzer {
             percussionCooldown = Array(repeating: 0, count: 2)
             percussionAttack = Array(repeating: 0, count: 2)
             previousBands = Array(repeating: 0, count: Self.bandCount)
+            bandAccents = Array(repeating: 0, count: Self.bandCount)
             beatStrength = 0
             rate = sampleRate; index = 0; filled = 0; hop = 0; bassFloor = 0; previousBass = 0
-            refractory = 0; beatPresence = 0
+            refractory = 0
             levels = Array(repeating: 0, count: Self.bandCount)
             displayLevels = Array(repeating: 0, count: Self.bandCount)
             previousMagnitudes = Array(repeating: 0, count: fftSize / 2)
+            binBands = (0..<(fftSize / 2)).map { bin in
+                let frequency = Double(bin) * sampleRate / Double(fftSize)
+                return (0..<Self.bandCount).first(where: { frequency >= bandEdges[$0] && frequency < bandEdges[$0 + 1] }) ?? -1
+            }
         }
         history[index] = value.isFinite ? min(4, max(-4, value)) : 0
         index = (index + 1) % fftSize; filled = min(fftSize, filled + 1); hop += 1
@@ -84,6 +91,7 @@ final class SpectrumAnalyzer {
         let dt = Double(hopSize) / sampleRate
         var bassEnergy = 0.0, vocalEnergy = 0.0, flux = 0.0
         var bands = [Double](repeating: 0, count: Self.bandCount)
+        var bandFlux = [Double](repeating: 0, count: Self.bandCount)
         var noiseEnergy = [Double](repeating: 0, count: 2)
         var noiseFlux = [Double](repeating: 0, count: 2)
         var noiseLogEnergy = [Double](repeating: 0, count: 2)
@@ -109,11 +117,12 @@ final class SpectrumAnalyzer {
                 noiseLogEnergy[zone] += log(max(1e-12, power))
                 noiseBins[zone] += 1
             }
-            if frequency >= 25 && frequency <= 16000 {
-                for band in 0..<Self.bandCount {
-                    let weight = max(0, 1 - abs(frequency - bandCenters[band]) / bandWidths[band])
-                    bands[band] += magnitude * magnitude * weight
-                }
+            let band = binBands[bin]
+            if band >= 0 {
+                let power = magnitude * magnitude
+                let previous = previousMagnitudes[bin]
+                bands[band] += power
+                bandFlux[band] += max(0, power - previous * previous)
             }
             previousMagnitudes[bin] = magnitude
         }
@@ -121,6 +130,8 @@ final class SpectrumAnalyzer {
         let fluxAmplitude = flux * 4 / Double(fftSize)
         let bassShare = bassEnergy / max(0.000001, bassEnergy + vocalEnergy)
         var hit = 0.0
+        var bassHit = 0.0
+        var percussionHits = [Double](repeating: 0, count: 2)
         refractory = max(0, refractory - dt)
         // React to the rising edge. Waiting for a fall moves the visible
         // accent behind the sound, especially on long bass notes.
@@ -128,6 +139,7 @@ final class SpectrumAnalyzer {
            bass > max(0.008, bassFloor * 1.45), bass > previousBass * 1.18,
            fluxAmplitude > bass * 0.22, bassShare > 0.45 {
             hit = min(1, max(0, (20 * log10(max(bass, 0.000001)) + 48) / 38))
+            bassHit = hit
             refractory = 0.12
         }
         for zone in 0..<2 {
@@ -142,12 +154,14 @@ final class SpectrumAnalyzer {
             if percussionCooldown[zone] == 0, amplitude > max(0.006, percussionFloor[zone] * 2.1),
                amplitude > previousPercussion[zone] * 1.35, novelty > 0.55, flatness > 0.24 {
                 hit = max(hit, strength)
+                percussionHits[zone] = strength
                 percussionCooldown[zone] = 0.075
                 percussionAttack[zone] = 0.012
             } else if percussionAttack[zone] > 0, flatness > 0.24 {
                 // Refine the same attack as the short window fills, without
                 // delaying its first frame or treating it as another beat.
                 hit = max(hit, strength)
+                percussionHits[zone] = strength
             }
             percussionAttack[zone] = max(0, percussionAttack[zone] - dt)
             percussionFloor[zone] += (amplitude - percussionFloor[zone]) * (1 - exp(-dt / 0.35))
@@ -157,19 +171,26 @@ final class SpectrumAnalyzer {
         bassFloor += (bass - bassFloor) * floorBlend
         previousBass = bass
         beatStrength = hit
-        beatPresence = max(hit, beatPresence * exp(-dt / 0.10))
-        if beatPresence < 0.006 { beatPresence = 0 }
-        let bassBody = bass / (bass + 0.08)
-        levels[0] = max(hit, bassBody * musicWeight[0], levels[0] * exp(-dt / release[0]))
-        for i in 1..<Self.bandCount {
+        for i in 0..<Self.bandCount {
             let amplitude = sqrt(bands[i]) * 4 / Double(fftSize)
-            let body = min(1, max(0, (20 * log10(max(0.000001, amplitude)) + 58) / 43))
-            // Melody is never gated by the drum detector. Use a soft amplitude
-            // curve so normal music does not pin all bars at the same height.
+            // Continuous voice and melody remain visible independently of
+            // percussion. Never multiply every band by one shared beat envelope.
             let musicalBody = amplitude / (amplitude + 0.08)
             let rise = max(0, amplitude - previousBands[i]) / max(0.008, amplitude)
-            let noteAccent = min(i == 2 || i == 3 ? 0.08 : 0.16, rise * musicalBody * 0.22)
-            let target = max(beatPresence * body * 0.83, musicalBody * musicWeight[i] + noteAccent)
+            let noteAccent = min((1...3).contains(i) ? 0.08 : 0.16, rise * musicalBody * 0.22)
+            let percussion: Double
+            switch i {
+            case 2: percussion = percussionHits[0]
+            case 3: percussion = max(percussionHits[0], percussionHits[1])
+            case 4, 5: percussion = percussionHits[1]
+            default: percussion = 0
+            }
+            // A drum may span several ranges, but each range needs its own
+            // rising energy. A kick cannot lift a held melody or a silent bar.
+            let novelty = min(1, bandFlux[i] / max(1e-12, bands[i]))
+            let accent = i == 0 ? bassHit : percussion * novelty * sqrt(musicalBody)
+            bandAccents[i] = max(accent, bandAccents[i] * exp(-dt / 0.075))
+            let target = max(bandAccents[i], musicalBody * musicWeight[i] + noteAccent)
             previousBands[i] = amplitude
             // Attack immediately. Only the falling edge needs smoothing.
             if target >= levels[i] { levels[i] = target }

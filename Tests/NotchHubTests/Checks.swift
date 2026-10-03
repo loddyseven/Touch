@@ -231,7 +231,7 @@ enum Checks {
                     let value = 0.22 * (kind == "hat" ? noise - low : noise) * envelope
                     if let levels = analyzer.feed(Float(value), sampleRate: rate) {
                         if analyzer.beatStrength > 0, time - (events.last ?? -1) > 0.1 { events.append(time) }
-                        peak = max(peak, levels[0])
+                        peak = max(peak, levels.max() ?? 0)
                     }
                 }
                 check(events.count == 6 && peak > 0.3, "Six \(kind) attacks remain visible at \(Int(rate)) Hz")
@@ -287,9 +287,60 @@ enum Checks {
             }
             return response
         }
-        let lowBand = bandResponse(frequency: 45), upperBand = bandResponse(frequency: 85)
+        let lowBand = bandResponse(frequency: 65), upperBand = bandResponse(frequency: 220)
         check(lowBand.count == 6 && upperBand.count == 6, "Every analysis result supplies all six visible bars")
-        check(upperBand[2] / upperBand[1] > lowBand[2] / lowBand[1] + 0.1, "A change in bass frequency changes the bar pattern, not just overall height")
+        check(lowBand[0] > lowBand[1] * 2 && upperBand[1] > upperBand[0] * 2, "Bass and low midrange drive distinct bars")
+        for rate in [44100.0, 48000, 96000] {
+            var quickResponses = true
+            for (band, frequency) in [65.0, 220, 650, 1800, 4500, 10500].enumerated() {
+                let analyzer = SpectrumAnalyzer()
+                var response = [Double](repeating: 0, count: 6)
+                var frames = 0
+                var onset: Double?
+                for sample in 0..<Int(rate * 0.5) {
+                    let time = Double(sample) / rate
+                    let signal = time < 0.1 ? 0 : 0.24 * sin(2 * Double.pi * frequency * (time - 0.1))
+                    if let values = analyzer.feed(Float(signal), sampleRate: rate) {
+                        if onset == nil, values[band] > 0.1 { onset = time }
+                        if time > 0.25 {
+                            frames += 1
+                            for i in response.indices { response[i] += values[i] }
+                        }
+                    }
+                }
+                let strongest = response.indices.max(by: { response[$0] < response[$1] })
+                let otherPeak = response.enumerated().filter { $0.offset != band }.map(\.element).max() ?? 0
+                check(strongest == band && response[band] / Double(frames) > 0.18 && otherPeak < response[band] * 0.3,
+                      "A \(Int(frequency))Hz tone drives its own bar at \(Int(rate))Hz")
+                quickResponses = quickResponses && onset != nil && onset! - 0.1 < 0.04
+            }
+            check(quickResponses, "All six bands start visibly within 40ms of a new note at \(Int(rate))Hz")
+            let melodyOnly = SpectrumAnalyzer(), mix = SpectrumAnalyzer()
+            var melodyFrame = [Double](repeating: 0, count: 6)
+            var interference = 0.0, bassPeak = 0.0
+            for sample in 0..<Int(rate * 1.5) {
+                let time = Double(sample) / rate
+                let melody = 0.18 * sin(2 * Double.pi * 1800 * time) + 0.12 * sin(2 * Double.pi * 10500 * time)
+                if let values = melodyOnly.feed(Float(melody), sampleRate: rate) { melodyFrame = values }
+                if let values = mix.feed(Float(melody + kick(time)), sampleRate: rate), time > 0.2 {
+                    interference = max(interference, abs(values[3] - melodyFrame[3]), abs(values[5] - melodyFrame[5]))
+                    bassPeak = max(bassPeak, values[0])
+                }
+            }
+            check(interference < 0.02 && bassPeak > 0.3,
+                  "Bass pulses do not pump sustained melody and treble at \(Int(rate))Hz")
+        }
+        let splitStereo = StereoSpectrumAnalyzer()
+        var splitResponse = [Double](repeating: 0, count: 6)
+        for sample in 0..<24000 {
+            let time = Double(sample) / 48000
+            if let values = splitStereo.feed(left: Float(0.2 * sin(2 * .pi * 650 * time)),
+                                             right: Float(0.2 * sin(2 * .pi * 10500 * time)), sampleRate: 48000), time > 0.25 {
+                splitResponse = values
+            }
+        }
+        check(splitResponse[2] > 0.18 && splitResponse[5] > 0.18 && splitResponse[0] < 0.02 && splitResponse[4] < 0.02,
+              "Separate stereo instruments keep their own bars without moving empty ranges")
         let cadence = SpectrumAnalyzer()
         var updates = 0, settled = false
         for sample in 0..<48000 {
